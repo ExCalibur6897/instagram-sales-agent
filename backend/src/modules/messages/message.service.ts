@@ -1,5 +1,6 @@
-import { IntentClassification } from "../ai/ai.types";
+import { IntentClassification, IntentName } from "../ai/ai.types";
 import { classifyIntent } from "../ai/classify-intent";
+import { extractMessageIntents } from "../ai/extract-message-intents";
 import { extractOrderData } from "../ai/extract-order-data";
 import {
   CartOperation,
@@ -59,9 +60,19 @@ class MessageService {
     const pendingState = checkoutStateService.get(input.userId);
     const memory = conversationMemoryService.get(input.userId);
     const rawClassification = await classifyIntent(input.message, memory);
-    const classification = this.enrichClassificationFromMessage(
+    const extractedIntents = prioritizeDetectedIntents(
+      this.enrichDetectedIntents(
+        await extractMessageIntents(input.message, memory),
+        rawClassification,
+        input.message
+      )
+    );
+    const classification = this.applyPrimaryIntent(
+      this.enrichClassificationFromMessage(
       this.applyConversationContext(rawClassification, memory),
       input.message
+      ),
+      extractedIntents
     );
     const purchaseIntentActive = this.resolvePurchaseIntentActive(
       input.message,
@@ -85,7 +96,12 @@ class MessageService {
     }
 
     if (classification.intent === "greeting") {
-      return this.buildGreetingResponse(input.message, classification, input.userId);
+      return this.buildGreetingResponse(
+        input.message,
+        classification,
+        input.userId,
+        extractedIntents
+      );
     }
 
     if (this.isFaqIntent(classification)) {
@@ -93,7 +109,8 @@ class MessageService {
         input.message,
         classification,
         input.userId,
-        Boolean(pendingState) || purchaseIntentActive
+        Boolean(pendingState) || purchaseIntentActive,
+        extractedIntents
       );
     }
 
@@ -126,7 +143,9 @@ class MessageService {
       return this.handleActiveCartOperations(
         input,
         pendingState,
-        cartOperations
+        cartOperations,
+        classification,
+        extractedIntents
       );
     }
 
@@ -139,7 +158,8 @@ class MessageService {
         input,
         pendingState,
         classification,
-        requestedItems
+        requestedItems,
+        extractedIntents
       );
     }
 
@@ -148,7 +168,8 @@ class MessageService {
         input,
         classification,
         requestedItems,
-        purchaseIntentActive
+        purchaseIntentActive,
+        extractedIntents
       );
     }
 
@@ -275,13 +296,23 @@ class MessageService {
       product,
       products: candidateProducts
     });
+    const decoratedAgentReply = this.decorateReplyWithSecondaryIntents(
+      agentReply,
+      {
+        ...classification,
+        intent: effectiveIntent
+      },
+      extractedIntents,
+      Boolean(pendingState) || effectiveHandoff,
+      input.message
+    );
 
     const response: MessageResponse = {
       channel: "instagram",
       userMessage: input.message,
       intent: effectiveIntent,
       productFound: Boolean(product),
-      agentReply,
+      agentReply: decoratedAgentReply,
       usedOpenAI: openAiClient.isConfigured(),
       handoff: effectiveHandoff,
       nextStep: shouldHandoffForBuyingIntent ? "collect_order_data" : undefined
@@ -384,7 +415,8 @@ class MessageService {
     input: HandleMessageInput,
     classification: IntentClassification,
     requestedItems: PurchaseItemInput[],
-    purchaseIntentActive: boolean
+    purchaseIntentActive: boolean,
+    extractedIntents: IntentName[]
   ): Promise<MessageResponse> {
     const resolution = this.resolvePurchaseItems(requestedItems);
 
@@ -438,7 +470,13 @@ class MessageService {
       userMessage: input.message,
       intent: "buying_intent",
       productFound: true,
-      agentReply: buildMultiItemCheckoutReply(cartItems),
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildMultiItemCheckoutReply(cartItems),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
       usedOpenAI: openAiClient.isConfigured(),
       handoff: true,
       nextStep: "collect_order_data"
@@ -448,7 +486,9 @@ class MessageService {
   private async handleActiveCartOperations(
     input: HandleMessageInput,
     pendingState: CheckoutState,
-    operations: CartOperation[]
+    operations: CartOperation[],
+    classification: IntentClassification,
+    extractedIntents: IntentName[]
   ): Promise<MessageResponse> {
     let cartItems = [...(pendingState.items ?? [])];
 
@@ -467,10 +507,16 @@ class MessageService {
           userMessage: input.message,
           intent: "buying_intent",
           productFound: cartItems.length > 0,
-          agentReply: buildCartOperationClarificationReply(
-            cartItems,
-            result.pendingItem,
-            operation.operation
+          agentReply: this.decorateReplyWithSecondaryIntents(
+            buildCartOperationClarificationReply(
+              cartItems,
+              result.pendingItem,
+              operation.operation
+            ),
+            classification,
+            extractedIntents,
+            true,
+            input.message
           ),
           usedOpenAI: openAiClient.isConfigured(),
           handoff: false
@@ -493,8 +539,13 @@ class MessageService {
         userMessage: input.message,
         intent: "buying_intent",
         productFound: false,
-        agentReply:
+        agentReply: this.decorateReplyWithSecondaryIntents(
           "Perfecto, actualice tu pedido. Tu carrito quedo vacio. Si queres, te ayudo a armar otro 🙌",
+          classification,
+          extractedIntents,
+          false,
+          input.message
+        ),
         usedOpenAI: openAiClient.isConfigured(),
         handoff: false
       };
@@ -507,7 +558,13 @@ class MessageService {
       userMessage: input.message,
       intent: "buying_intent",
       productFound: true,
-      agentReply: buildCartModifiedReply(cartItems),
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildCartModifiedReply(cartItems),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
       usedOpenAI: openAiClient.isConfigured(),
       handoff: true,
       nextStep: "collect_order_data"
@@ -518,7 +575,8 @@ class MessageService {
     input: HandleMessageInput,
     pendingState: CheckoutState,
     classification: IntentClassification,
-    requestedItems: PurchaseItemInput[]
+    requestedItems: PurchaseItemInput[],
+    extractedIntents: IntentName[]
   ): Promise<MessageResponse> {
     const existingCartItems = pendingState.items ?? [];
     const pendingCartItems = this.buildPendingCartItems(
@@ -549,9 +607,15 @@ class MessageService {
         userMessage: input.message,
         intent: "buying_intent",
         productFound: updatedCartItems.length > 0,
-        agentReply: buildPartialCartClarificationReply(
-          updatedCartItems,
-          resolution.pendingItems[0]
+        agentReply: this.decorateReplyWithSecondaryIntents(
+          buildPartialCartClarificationReply(
+            updatedCartItems,
+            resolution.pendingItems[0]
+          ),
+          classification,
+          extractedIntents,
+          true,
+          input.message
         ),
         usedOpenAI: openAiClient.isConfigured(),
         handoff: false
@@ -565,7 +629,13 @@ class MessageService {
       userMessage: input.message,
       intent: "buying_intent",
       productFound: true,
-      agentReply: buildCartUpdatedReply(updatedCartItems, resolvedCartItems),
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildCartUpdatedReply(updatedCartItems, resolvedCartItems),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
       usedOpenAI: openAiClient.isConfigured(),
       handoff: true,
       nextStep: "collect_order_data"
@@ -1118,6 +1188,97 @@ class MessageService {
     });
   }
 
+  private applyPrimaryIntent(
+    classification: IntentClassification,
+    detectedIntents: IntentName[]
+  ): IntentClassification {
+    const primaryIntent = detectedIntents[0];
+
+    if (!primaryIntent || primaryIntent === classification.intent) {
+      return classification;
+    }
+
+    return {
+      ...classification,
+      intent: primaryIntent
+    };
+  }
+
+  private enrichDetectedIntents(
+    detectedIntents: IntentName[],
+    classification: IntentClassification,
+    message: string
+  ): IntentName[] {
+    const enriched = [...detectedIntents];
+
+    if (
+      classification.intent === "buying_intent" ||
+      looksLikeDirectBuyingMessage(message)
+    ) {
+      enriched.push("buying_intent");
+    }
+
+    if (looksLikeExplicitPriceMessage(message)) {
+      enriched.push("price_question");
+    }
+
+    if (looksLikeGreetingMessage(message)) {
+      enriched.push("greeting");
+    }
+
+    for (const faqIntent of detectFaqIntentsFromMessage(message)) {
+      enriched.push(faqIntent);
+    }
+
+    return [...new Set(enriched)];
+  }
+
+  private decorateReplyWithSecondaryIntents(
+    baseReply: string,
+    classification: IntentClassification,
+    extractedIntents: string[],
+    hasPendingPurchaseContext: boolean,
+    message: string
+  ): string {
+    const secondaryIntents = extractedIntents
+      .filter((intent) => intent !== classification.intent)
+      .slice(0, 3) as IntentName[];
+    const parts: string[] = [];
+
+    if (secondaryIntents.includes("greeting")) {
+      parts.push(buildGreetingLead(message, classification.tone));
+    }
+
+    parts.push(baseReply);
+
+    for (const intent of secondaryIntents) {
+      if (!isFaqIntentName(intent)) {
+        continue;
+      }
+
+      const faqIntents = secondaryIntents.filter(isFaqIntentName);
+
+      if (classification.intent === "buying_intent" && faqIntents.length > 0) {
+        parts.push(buildFaqSummaryReply(faqIntents));
+        break;
+      }
+
+      parts.push(
+        buildFaqReply(
+          {
+            ...classification,
+            intent
+          },
+          {
+            hasPendingPurchaseContext
+          }
+        )
+      );
+    }
+
+    return [...new Set(parts.filter(Boolean))].join("\n");
+  }
+
   private resolvePurchaseIntentActive(
     message: string,
     classification: IntentClassification,
@@ -1259,7 +1420,8 @@ class MessageService {
     message: string,
     classification: IntentClassification,
     userId: string,
-    hasPendingPurchaseContext: boolean
+    hasPendingPurchaseContext: boolean,
+    extractedIntents: string[]
   ): MessageResponse {
     conversationMemoryService.remember(userId, {
       intent: classification.intent
@@ -1270,9 +1432,17 @@ class MessageService {
       userMessage: message,
       intent: classification.intent,
       productFound: false,
-      agentReply: buildFaqReply(
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildFaqReply(
+          classification,
+          {
+            hasPendingPurchaseContext
+          }
+        ),
         classification,
-        hasPendingPurchaseContext
+        extractedIntents,
+        hasPendingPurchaseContext,
+        message
       ),
       usedOpenAI: openAiClient.isConfigured(),
       handoff: false
@@ -1282,7 +1452,8 @@ class MessageService {
   private buildGreetingResponse(
     message: string,
     classification: IntentClassification,
-    userId: string
+    userId: string,
+    extractedIntents: string[]
   ): MessageResponse {
     conversationMemoryService.remember(userId, {
       intent: classification.intent
@@ -1293,7 +1464,13 @@ class MessageService {
       userMessage: message,
       intent: classification.intent,
       productFound: false,
-      agentReply: buildGreetingReply(message, classification.tone),
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildGreetingReply(message, classification.tone),
+        classification,
+        extractedIntents,
+        false,
+        message
+      ),
       usedOpenAI: openAiClient.isConfigured(),
       handoff: false
     };
@@ -1549,6 +1726,170 @@ function buildGreetingReply(message: string, tone: string): string {
   }
 
   return "¡Hola! 👋 ¿En qué te puedo ayudar hoy?";
+}
+
+function buildGreetingLead(message: string, tone: string): string {
+  const normalized = message.toLowerCase();
+  const isCasual =
+    tone === "casual" ||
+    normalized.includes("bro") ||
+    normalized.includes("man");
+
+  return isCasual ? "Â¡Buenas!" : "Â¡Hola!";
+}
+
+function looksLikeGreetingMessage(message: string): boolean {
+  const normalized = message.toLowerCase();
+
+  return (
+    normalized.includes("hola") ||
+    normalized.includes("buenas") ||
+    normalized.includes("bro") ||
+    normalized.includes("man")
+  );
+}
+
+function looksLikeDirectBuyingMessage(message: string): boolean {
+  const normalized = normalizeResumeMessage(message);
+
+  return (
+    normalized.includes("quiero comprar") ||
+    normalized.includes("quiero un") ||
+    normalized.includes("quiero una") ||
+    normalized.includes("dame un") ||
+    normalized.includes("dame una") ||
+    normalized.includes("llevar") ||
+    normalized.includes("pedido") ||
+    normalized.includes("apartar")
+  );
+}
+
+function looksLikeExplicitPriceMessage(message: string): boolean {
+  const normalized = normalizeResumeMessage(message);
+
+  return (
+    normalized.includes("cuanto vale") ||
+    normalized.includes("cuanto cuesta") ||
+    normalized.includes("cuanto es") ||
+    normalized.includes("precio")
+  );
+}
+
+function prioritizeDetectedIntents(intents: IntentName[]): IntentName[] {
+  return [...new Set(intents)]
+    .filter((intent) => intent !== "unknown")
+    .sort((left, right) => getIntentPriority(left) - getIntentPriority(right))
+    .slice(0, 4);
+}
+
+function getIntentPriority(intent: IntentName): number {
+  if (intent === "buying_intent") {
+    return 1;
+  }
+
+  if (
+    intent === "product_search" ||
+    intent === "price_question" ||
+    intent === "product_availability" ||
+    intent === "collection_request"
+  ) {
+    return 2;
+  }
+
+  if (isFaqIntentName(intent)) {
+    return 3;
+  }
+
+  if (intent === "greeting") {
+    return 4;
+  }
+
+  return 5;
+}
+
+function isFaqIntentName(intent: IntentName): boolean {
+  return [
+    "faq_location",
+    "faq_hours",
+    "faq_payment",
+    "faq_shipping"
+  ].includes(intent);
+}
+
+function buildFaqSummaryReply(intents: IntentName[]): string {
+  const faqLabels = intents
+    .filter(isFaqIntentName)
+    .map((intent) => mapFaqIntentToLabel(intent));
+
+  if (faqLabels.length === 0) {
+    return "";
+  }
+
+  if (faqLabels.length === 1) {
+    return `Sobre ${faqLabels[0]}, el equipo te confirma ese detalle por este medio.`;
+  }
+
+  if (faqLabels.length === 2) {
+    return `Sobre ${faqLabels[0]} y ${faqLabels[1]}, el equipo te confirma esos detalles por este medio.`;
+  }
+
+  return `Sobre ${faqLabels.slice(0, -1).join(", ")} y ${faqLabels[faqLabels.length - 1]}, el equipo te confirma esos detalles por este medio.`;
+}
+
+function mapFaqIntentToLabel(intent: IntentName): string {
+  switch (intent) {
+    case "faq_location":
+      return "ubicacion";
+    case "faq_hours":
+      return "horario";
+    case "faq_payment":
+      return "metodos de pago";
+    case "faq_shipping":
+      return "envios";
+    default:
+      return "ese detalle";
+  }
+}
+
+function detectFaqIntentsFromMessage(message: string): IntentName[] {
+  const normalized = normalizeResumeMessage(message);
+  const intents: IntentName[] = [];
+
+  if (
+    normalized.includes("envio") ||
+    normalized.includes("envian") ||
+    normalized.includes("delivery")
+  ) {
+    intents.push("faq_shipping");
+  }
+
+  if (
+    normalized.includes("pago") ||
+    normalized.includes("transferencia") ||
+    normalized.includes("metodos de pago") ||
+    normalized.includes("aceptan tarjeta")
+  ) {
+    intents.push("faq_payment");
+  }
+
+  if (
+    normalized.includes("donde estan") ||
+    normalized.includes("ubicacion") ||
+    normalized.includes("ubicados") ||
+    normalized.includes("direccion")
+  ) {
+    intents.push("faq_location");
+  }
+
+  if (
+    normalized.includes("horario") ||
+    normalized.includes("abren") ||
+    normalized.includes("cierran")
+  ) {
+    intents.push("faq_hours");
+  }
+
+  return [...new Set(intents)];
 }
 
 function looksLikePurchaseIntentMessage(message: string): boolean {
