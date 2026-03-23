@@ -62,7 +62,7 @@ const fallbackClassification = (message: string): IntentClassification => ({
   isListRequest: detectListRequest(message),
   refersToPreviousProduct: detectContextReference(message),
   handoff: false,
-  tone: "neutral"
+  tone: detectTone(message)
 });
 
 function extractProductHint(message: string): string | null {
@@ -92,7 +92,7 @@ export async function classifyIntent(
       instructions: [
         "Eres un clasificador de intencion para mensajes de Instagram en espanol conversacional.",
         "Devuelve solo JSON valido con la estructura requerida.",
-        "Debes entender expresiones informales como man, porfa, la negra, y referencias al contexto reciente.",
+        "Debes entender expresiones informales como man, porfa, la negra, y ropa negra, playera, camisa, sudadera, polo, gorra y pantaloneta.",
         "Si el mensaje es un FAQ de ubicacion, horario, pagos o envios, prioriza ese FAQ aunque exista contexto de compra.",
         "Usa product_search para consultas abiertas de un producto o categoria.",
         "Usa collection_request cuando el usuario pida varias opciones o toda una coleccion.",
@@ -118,7 +118,7 @@ export async function classifyIntent(
 }
 
 function detectFallbackIntent(message: string): IntentClassification["intent"] {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   const faqIntent = detectFaqIntent(message);
 
   if (faqIntent) {
@@ -128,42 +128,68 @@ function detectFallbackIntent(message: string): IntentClassification["intent"] {
   if (
     normalized.includes("compr") ||
     normalized.includes("pedido") ||
-    normalized.includes("llevar")
+    normalized.includes("llevar") ||
+    normalized.includes("apart")
   ) {
     return "buying_intent";
-  }
-
-  if (
-    normalized.includes("tienen") ||
-    normalized.includes("busco") ||
-    normalized.includes("dime")
-  ) {
-    return detectListRequest(message) ? "collection_request" : "product_search";
   }
 
   if (normalized.includes("cuanto") || normalized.includes("precio")) {
     return "price_question";
   }
 
+  if (
+    normalized.includes("tienen") ||
+    normalized.includes("busco") ||
+    normalized.includes("dime") ||
+    normalized.includes("mostra") ||
+    normalized.includes("muestra") ||
+    normalized.includes("que ") ||
+    detectCategory(message) !== null ||
+    detectColor(message) !== null
+  ) {
+    return detectListRequest(message) ? "collection_request" : "product_search";
+  }
+
+  if (
+    normalized.includes("hola") ||
+    normalized.includes("buenas") ||
+    normalized.includes("bro") ||
+    normalized.includes("man") ||
+    normalized.includes("q ondas")
+  ) {
+    return "greeting";
+  }
+
   return "unknown";
 }
 
 function detectCategory(message: string): string | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   const categoryAliases: Record<string, string> = {
     camiseta: "camiseta",
-    camisa: "camisa",
+    camisetas: "camiseta",
+    camisa: "camiseta",
+    camisas: "camiseta",
+    playera: "camiseta",
+    playeras: "camiseta",
     hoodie: "hoodie",
     hoodies: "hoodie",
     hudi: "hoodie",
+    sudadera: "hoodie",
+    sudaderas: "hoodie",
     gorra: "gorra",
+    gorras: "gorra",
     jogger: "jogger",
     joggers: "jogger",
+    yuger: "jogger",
     yugers: "jogger",
-    cargo: "cargo",
     polo: "polo",
+    polos: "polo",
     pantaloneta: "short",
+    pantalonetas: "short",
     short: "short",
+    shorts: "short",
     ropa: "ropa"
   };
 
@@ -174,7 +200,7 @@ function detectCategory(message: string): string | null {
 }
 
 function detectColor(message: string): string | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   const colors = [
     "negra",
     "negro",
@@ -184,14 +210,16 @@ function detectColor(message: string): string | null {
     "beige",
     "denim",
     "rojo",
-    "roja"
+    "roja",
+    "azul",
+    "navy"
   ];
 
   return colors.find((color) => normalized.includes(color)) ?? null;
 }
 
 function detectQuantity(message: string): number | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   const digitMatch = normalized.match(/\b(\d+)\b/);
 
   if (digitMatch) {
@@ -208,7 +236,7 @@ function detectQuantity(message: string): number | null {
   };
 
   for (const [word, value] of Object.entries(numberWords)) {
-    if (normalized.includes(word)) {
+    if (new RegExp(`\\b${word}\\b`).test(normalized)) {
       return value;
     }
   }
@@ -217,22 +245,26 @@ function detectQuantity(message: string): number | null {
 }
 
 function detectListRequest(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   return (
     normalized.includes("toda") ||
     normalized.includes("tienen") ||
     normalized.includes("que tienen") ||
     normalized.includes("muestr") ||
-    normalized.includes("dime")
+    normalized.includes("dime") ||
+    normalized.includes("que ")
   );
 }
 
 function detectContextReference(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
   return (
     normalized.includes("la negra") ||
     normalized.includes("esa") ||
     normalized.includes("ese") ||
+    normalized.includes("la otra") ||
+    normalized.includes("las otras") ||
+    normalized.includes("solo una") ||
     normalized.includes("uno") ||
     normalized.includes("el mismo") ||
     normalized.includes("quiero comprar dos")
@@ -242,13 +274,12 @@ function detectContextReference(message: string): boolean {
 function detectFaqIntent(
   message: string
 ): IntentClassification["intent"] | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalize(message);
 
   if (
     normalized.includes("donde estan") ||
     normalized.includes("ubicacion") ||
-    normalized.includes("direccion") ||
-    normalized.includes("dónde están")
+    normalized.includes("direccion")
   ) {
     return "faq_location";
   }
@@ -265,17 +296,14 @@ function detectFaqIntent(
     normalized.includes("pago") ||
     normalized.includes("pagan") ||
     normalized.includes("metodos de pago") ||
-    normalized.includes("métodos de pago") ||
     normalized.includes("aceptan tarjeta") ||
-    normalized.includes("como se paga") ||
-    normalized.includes("cómo se paga")
+    normalized.includes("como se paga")
   ) {
     return "faq_payment";
   }
 
   if (
     normalized.includes("envio") ||
-    normalized.includes("envían") ||
     normalized.includes("envian") ||
     normalized.includes("delivery")
   ) {
@@ -283,4 +311,37 @@ function detectFaqIntent(
   }
 
   return null;
+}
+
+function detectTone(message: string): IntentClassification["tone"] {
+  const normalized = normalize(message);
+
+  if (
+    normalized.includes("bro") ||
+    normalized.includes("man") ||
+    normalized.includes("rey") ||
+    normalized.includes("porfa")
+  ) {
+    return "casual";
+  }
+
+  if (
+    normalized.includes("molesto") ||
+    normalized.includes("mal") ||
+    normalized.includes("nada que ver")
+  ) {
+    return "upset";
+  }
+
+  return "neutral";
+}
+
+function normalize(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }

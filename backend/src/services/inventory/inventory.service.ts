@@ -308,10 +308,23 @@ function normalizeCategory(value: string | null | undefined): string {
   const normalized = singularize(normalize(value));
   const aliases: Record<string, string> = {
     hudi: "hoodie",
+    sudadera: "hoodie",
     yuger: "jogger",
+    camisa: "camiseta",
+    playera: "camiseta",
     polo: "polo",
     pantaloneta: "short"
   };
+
+  if (
+    normalized === "ropa" ||
+    normalized === "clothing" ||
+    normalized === "clothe" ||
+    normalized === "prenda" ||
+    normalized === "articulo"
+  ) {
+    return "";
+  }
 
   return aliases[normalized] ?? normalized;
 }

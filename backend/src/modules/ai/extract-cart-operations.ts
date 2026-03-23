@@ -5,7 +5,8 @@ export type CartOperationType =
   | "add_item"
   | "remove_item"
   | "update_quantity"
-  | "replace_item";
+  | "replace_item"
+  | "keep_only_item";
 
 export type CartOperation = {
   operation: CartOperationType;
@@ -15,6 +16,8 @@ export type CartOperation = {
   quantity: number | null;
   keywords: string[];
   replacementItem: PurchaseItemInput | null;
+  useContextTarget: boolean;
+  refersToOthers: boolean;
 };
 
 type CartOperationsExtraction = {
@@ -33,7 +36,13 @@ const cartOperationSchema = {
         properties: {
           operation: {
             type: "string",
-            enum: ["add_item", "remove_item", "update_quantity", "replace_item"]
+            enum: [
+              "add_item",
+              "remove_item",
+              "update_quantity",
+              "replace_item",
+              "keep_only_item"
+            ]
           },
           productName: {
             type: ["string", "null"]
@@ -77,6 +86,12 @@ const cartOperationSchema = {
               }
             },
             required: ["productName", "category", "color", "quantity", "keywords"]
+          },
+          useContextTarget: {
+            type: "boolean"
+          },
+          refersToOthers: {
+            type: "boolean"
           }
         },
         required: [
@@ -86,7 +101,9 @@ const cartOperationSchema = {
           "color",
           "quantity",
           "keywords",
-          "replacementItem"
+          "replacementItem",
+          "useContextTarget",
+          "refersToOthers"
         ]
       }
     }
@@ -97,8 +114,15 @@ const cartOperationSchema = {
 export async function extractCartOperations(
   message: string
 ): Promise<CartOperation[]> {
+  const fallbackOperations = fallbackExtractCartOperations(message);
+  const normalizedMessage = normalize(message);
+
+  if (!hasExplicitCartOperationLanguage(normalizedMessage)) {
+    return fallbackOperations;
+  }
+
   if (!openAiClient.isConfigured()) {
-    return fallbackExtractCartOperations(message);
+    return fallbackOperations;
   }
 
   try {
@@ -107,8 +131,10 @@ export async function extractCartOperations(
         instructions: [
           "Extrae operaciones de carrito desde mensajes de compra en espanol conversacional.",
           "Devuelve solo JSON valido.",
-          "Usa add_item, remove_item, update_quantity o replace_item.",
-          "Entiende frases como agregame otra, quitame uno, dejame solo uno, cambialo por otro y sabes que mejor.",
+          "Usa add_item, remove_item, update_quantity, replace_item o keep_only_item.",
+          "Usa keep_only_item para frases como ya solo quiero una gorra negra, dejame solo un jogger o solo quiero esta.",
+          "Activa useContextTarget cuando el mensaje depende del contexto del carrito, por ejemplo solo una, esa, la otra, las otras o quitalas.",
+          "Activa refersToOthers cuando el mensaje habla de las otras, los otros o lo demas.",
           "Extrae category, color, quantity, productName y keywords utiles como oversize o classic.",
           "Si no se menciona cantidad y la operacion es add_item, usa 1.",
           "Si no se menciona cantidad y la operacion es remove_item, usa null para indicar quitar el item completo.",
@@ -120,38 +146,20 @@ export async function extractCartOperations(
         schema: cartOperationSchema
       });
 
-    return sanitizeOperations(output.operations);
+    return keepMentionedOperationKeywords(
+      mergeCartOperations(sanitizeOperations(output.operations), fallbackOperations),
+      message
+    );
   } catch {
-    return fallbackExtractCartOperations(message);
+    return fallbackOperations;
   }
 }
 
 function fallbackExtractCartOperations(message: string): CartOperation[] {
-  const normalizedMessage = normalize(message);
+  const normalizedMessage = normalizeWithDelimiters(message);
 
   if (!looksLikeCartOperationMessage(normalizedMessage)) {
     return [];
-  }
-
-  const replaceMatch = normalizedMessage.match(
-    /(?:cambiame|cambia|cambialo|cambiala|cambiala|cambiala|cambiá)\s+(.+?)\s+por\s+(.+)/
-  );
-
-  if (replaceMatch) {
-    const targetItem = parseItemPart(replaceMatch[1]);
-    const replacementItem = parseItemPart(replaceMatch[2]);
-
-    return sanitizeOperations([
-      {
-        operation: "replace_item",
-        productName: targetItem.productName,
-        category: targetItem.category,
-        color: targetItem.color,
-        quantity: targetItem.quantity,
-        keywords: targetItem.keywords,
-        replacementItem
-      }
-    ]);
   }
 
   return sanitizeOperations(
@@ -162,6 +170,27 @@ function fallbackExtractCartOperations(message: string): CartOperation[] {
 }
 
 function parseCartOperationPart(part: string): CartOperation | null {
+  const replaceMatch = part.match(
+    /(?:cambiame|cambia|cambialo|cambiala|cambia la|cambia el|cambia las|cambia los)\s+(.+?)\s+por\s+(.+)/
+  );
+
+  if (replaceMatch) {
+    const targetItem = parseItemPart(replaceMatch[1]);
+    const replacementItem = parseItemPart(replaceMatch[2]);
+
+    return {
+      operation: "replace_item",
+      productName: targetItem.productName,
+      category: targetItem.category,
+      color: targetItem.color,
+      quantity: targetItem.quantity,
+      keywords: targetItem.keywords,
+      replacementItem,
+      useContextTarget: shouldUseContextTarget(part, targetItem),
+      refersToOthers: false
+    };
+  }
+
   const operation = detectOperation(part);
 
   if (!operation) {
@@ -169,12 +198,15 @@ function parseCartOperationPart(part: string): CartOperation | null {
   }
 
   const item = parseItemPart(part);
+  const useContextTarget = shouldUseContextTarget(part, item);
+  const refersToOthers = mentionsOtherItems(part);
 
   if (
     !item.productName &&
     !item.category &&
     !item.color &&
-    item.keywords.length === 0
+    item.keywords.length === 0 &&
+    !useContextTarget
   ) {
     return null;
   }
@@ -189,31 +221,111 @@ function parseCartOperationPart(part: string): CartOperation | null {
         ? null
         : item.quantity,
     keywords: item.keywords,
-    replacementItem: null
+    replacementItem: null,
+    useContextTarget,
+    refersToOthers
   };
 }
 
 function sanitizeOperations(operations: CartOperation[]): CartOperation[] {
   return operations
-    .map((operation) => ({
-      operation: operation.operation,
-      productName: sanitizeItem(operation).productName,
-      category: sanitizeItem(operation).category,
-      color: sanitizeItem(operation).color,
-      quantity: sanitizeQuantity(operation),
-      keywords: sanitizeItem(operation).keywords,
-      replacementItem: operation.replacementItem
-        ? sanitizePurchaseItem(operation.replacementItem)
-        : null
-    }))
+    .map((operation) => {
+      const sanitizedItem = sanitizeItem(operation);
+
+      return {
+        operation: operation.operation,
+        productName: sanitizedItem.productName,
+        category: sanitizedItem.category,
+        color: sanitizedItem.color,
+        quantity: sanitizeQuantity(operation),
+        keywords: sanitizedItem.keywords,
+        replacementItem: operation.replacementItem
+          ? sanitizePurchaseItem(operation.replacementItem)
+          : null,
+        useContextTarget: Boolean(operation.useContextTarget),
+        refersToOthers: Boolean(operation.refersToOthers)
+      };
+    })
     .filter(
       (operation) =>
         operation.replacementItem !== null ||
         operation.productName ||
         operation.category ||
         operation.color ||
-        operation.keywords.length > 0
+        operation.keywords.length > 0 ||
+        operation.useContextTarget
     );
+}
+
+function mergeCartOperations(
+  primaryOperations: CartOperation[],
+  fallbackOperations: CartOperation[]
+): CartOperation[] {
+  const mergedOperations: CartOperation[] = [];
+  const maxLength = Math.max(primaryOperations.length, fallbackOperations.length);
+
+  for (let index = 0; index < maxLength; index += 1) {
+    const primaryOperation = primaryOperations[index];
+    const fallbackOperation = fallbackOperations[index];
+
+    if (!primaryOperation && fallbackOperation) {
+      mergedOperations.push(fallbackOperation);
+      continue;
+    }
+
+    if (!primaryOperation) {
+      continue;
+    }
+
+    if (!fallbackOperation) {
+      mergedOperations.push(primaryOperation);
+      continue;
+    }
+
+    mergedOperations.push({
+      operation: resolveMergedOperation(primaryOperation, fallbackOperation),
+      productName: primaryOperation.productName ?? fallbackOperation.productName,
+      category: primaryOperation.category ?? fallbackOperation.category,
+      color: primaryOperation.color ?? fallbackOperation.color,
+      quantity: primaryOperation.quantity ?? fallbackOperation.quantity,
+      keywords: [
+        ...new Set([
+          ...(primaryOperation.keywords ?? []),
+          ...(fallbackOperation.keywords ?? [])
+        ])
+      ],
+      replacementItem:
+        primaryOperation.replacementItem ?? fallbackOperation.replacementItem,
+      useContextTarget:
+        primaryOperation.useContextTarget || fallbackOperation.useContextTarget,
+      refersToOthers:
+        primaryOperation.refersToOthers || fallbackOperation.refersToOthers
+    });
+  }
+
+  return sanitizeOperations(mergedOperations);
+}
+
+function keepMentionedOperationKeywords(
+  operations: CartOperation[],
+  message: string
+): CartOperation[] {
+  const normalizedMessage = normalize(message);
+
+  return operations.map((operation) => ({
+    ...operation,
+    keywords: (operation.keywords ?? []).filter((keyword) =>
+      normalizedMessage.includes(normalize(keyword))
+    ),
+    replacementItem: operation.replacementItem
+      ? {
+          ...operation.replacementItem,
+          keywords: (operation.replacementItem.keywords ?? []).filter((keyword) =>
+            normalizedMessage.includes(normalize(keyword))
+          )
+        }
+      : null
+  }));
 }
 
 function sanitizeItem(operation: {
@@ -285,32 +397,28 @@ function parseItemPart(part: string): PurchaseItemInput {
 }
 
 function detectOperation(part: string): CartOperationType | null {
-  if (
-    part.includes("quitame") ||
-    part.includes("quitá") ||
-    part.includes("quita") ||
-    part.includes("sacame") ||
-    part.includes("saca")
-  ) {
-    return "remove_item";
+  const item = parseItemPart(part);
+
+  if (looksLikeExplicitKeepOnlyPhrase(part)) {
+    return "keep_only_item";
   }
 
-  if (
-    part.includes("dejame solo") ||
-    part.includes("deja solo") ||
-    part.includes("solo quiero") ||
-    part.includes("dejalo en") ||
-    part.includes("dejala en")
-  ) {
+  if (looksLikeQuantityAdjustmentPhrase(part, item)) {
     return "update_quantity";
   }
 
   if (
-    part.includes("cambiame") ||
-    part.includes("cambiá") ||
-    part.includes("cambia")
+    part.includes("quitame") ||
+    part.includes("quita") ||
+    part.includes("sacame") ||
+    part.includes("saca") ||
+    part.includes("ya no quiero")
   ) {
-    return "replace_item";
+    return "remove_item";
+  }
+
+  if (part.includes("dejalo en") || part.includes("dejala en")) {
+    return "update_quantity";
   }
 
   if (
@@ -329,21 +437,135 @@ function detectOperation(part: string): CartOperationType | null {
   return null;
 }
 
+function resolveMergedOperation(
+  primaryOperation: CartOperation,
+  fallbackOperation: CartOperation
+): CartOperationType {
+  if (
+    primaryOperation.operation === "keep_only_item" &&
+    fallbackOperation.operation === "update_quantity"
+  ) {
+    return "update_quantity";
+  }
+
+  if (
+    primaryOperation.operation === "update_quantity" &&
+    fallbackOperation.operation === "keep_only_item"
+  ) {
+    return "update_quantity";
+  }
+
+  return primaryOperation.operation ?? fallbackOperation.operation;
+}
+
+function looksLikeExplicitKeepOnlyPhrase(part: string): boolean {
+  return (
+    part.includes("quita todo menos") ||
+    part.includes("quiero unicamente") ||
+    part.includes("quiero solo la") ||
+    part.includes("quiero solo el") ||
+    part.includes("dejame unicamente") ||
+    part.includes("dejame esa") ||
+    part.includes("dejame ese") ||
+    part.includes("dejame esta") ||
+    part.includes("dejame esto") ||
+    part.includes("dejame nada mas") ||
+    part.includes("dejame nomas") ||
+    /(?:solo quiero|ya solo quiero|dejame solo)\s+(?:la|el|esa|ese|esto)\b/.test(part)
+  );
+}
+
+function looksLikeQuantityAdjustmentPhrase(
+  part: string,
+  item: PurchaseItemInput
+): boolean {
+  const hasTarget = Boolean(
+    item.productName || item.category || item.color || item.keywords.length > 0
+  );
+
+  if (!hasTarget || !hasExplicitQuantity(part)) {
+    return false;
+  }
+
+  return (
+    part.includes("solo quiero") ||
+    part.includes("ya solo quiero") ||
+    part.includes("quiero solo") ||
+    part.includes("quiero solo") ||
+    part.includes("dejame ") ||
+    part.includes("quiero ")
+  );
+}
+
 function looksLikeCartOperationMessage(message: string): boolean {
   return (
-    message.includes("sabes que") ||
     message.includes("sabes que") ||
     message.includes("mejor") ||
     message.includes("agreg") ||
     message.includes("sumale") ||
     message.includes("quita") ||
     message.includes("quitame") ||
-    message.includes("quitá") ||
     message.includes("dejame solo") ||
     message.includes("solo quiero") ||
+    message.includes("ya solo quiero") ||
+    message.includes("quiero solo") ||
+    message.includes("unicamente") ||
+    message.includes("todo menos") ||
     message.includes("cambia") ||
     message.includes("cambiame") ||
-    message.includes("cambiá")
+    message.includes("ya no quiero")
+  );
+}
+
+function shouldUseContextTarget(
+  part: string,
+  item: PurchaseItemInput
+): boolean {
+  if (item.productName || item.category || item.color || item.keywords.length > 0) {
+    return false;
+  }
+
+  return (
+    part.includes("solo una") ||
+    part.includes("solo uno") ||
+    part.includes("esa") ||
+    part.includes("ese") ||
+    part.includes("eso") ||
+    part.includes("la otra") ||
+    part.includes("las otras") ||
+    part.includes("los otros") ||
+    part.includes("lo otro")
+  );
+}
+
+function hasExplicitCartOperationLanguage(message: string): boolean {
+  return (
+    message.includes("agreg") ||
+    message.includes("suma") ||
+    message.includes("quita") ||
+    message.includes("quitame") ||
+    message.includes("saca") ||
+    message.includes("ya no quiero") ||
+    message.includes("solo quiero") ||
+    message.includes("ya solo quiero") ||
+    message.includes("quiero solo") ||
+    message.includes("dejame") ||
+    message.includes("unicamente") ||
+    message.includes("todo menos") ||
+    message.includes("cambia") ||
+    message.includes("cambiame")
+  );
+}
+
+function mentionsOtherItems(part: string): boolean {
+  return (
+    part.includes("la otra") ||
+    part.includes("el otro") ||
+    part.includes("las otras") ||
+    part.includes("los otros") ||
+    part.includes("lo otro") ||
+    part.includes("los demas") ||
+    part.includes("las demas")
   );
 }
 
@@ -385,7 +607,7 @@ function detectQuantity(message: string): number | null {
   }
 
   for (const [word, value] of Object.entries(NUMBER_WORD_MAP)) {
-    if (normalized.includes(word)) {
+    if (new RegExp(`\\b${word}\\b`).test(normalized)) {
       return value;
     }
   }
@@ -395,20 +617,12 @@ function detectQuantity(message: string): number | null {
 
 function detectCategory(message: string): string | null {
   const normalized = normalize(message);
-
-  return (
-    Object.entries(CATEGORY_ALIASES).find(([alias]) => normalized.includes(alias))?.[1] ??
-    null
-  );
+  return findEarliestAlias(normalized, CATEGORY_ALIASES);
 }
 
 function detectColor(message: string): string | null {
   const normalized = normalize(message);
-
-  return (
-    Object.entries(COLOR_ALIASES).find(([alias]) => normalized.includes(alias))?.[1] ??
-    null
-  );
+  return findEarliestAlias(normalized, COLOR_ALIASES);
 }
 
 function detectKeywords(message: string): string[] {
@@ -421,6 +635,16 @@ function normalize(value: string | null | undefined): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^\w\s]/g, " ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeWithDelimiters(value: string | null | undefined): string {
+  return (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s,]/g, " ")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
@@ -455,6 +679,27 @@ function normalizeColor(value: string | null | undefined): string | null {
   return COLOR_ALIASES[normalized] ?? normalized;
 }
 
+function findEarliestAlias(
+  normalizedMessage: string,
+  aliases: Record<string, string>
+): string | null {
+  let bestMatch: { index: number; value: string } | null = null;
+
+  for (const [alias, value] of Object.entries(aliases)) {
+    const index = normalizedMessage.indexOf(alias);
+
+    if (index === -1) {
+      continue;
+    }
+
+    if (!bestMatch || index < bestMatch.index) {
+      bestMatch = { index, value };
+    }
+  }
+
+  return bestMatch?.value ?? null;
+}
+
 const NUMBER_WORD_MAP: Record<string, number> = {
   un: 1,
   una: 1,
@@ -483,6 +728,8 @@ const CATEGORY_ALIASES: Record<string, string> = {
   camisetas: "camiseta",
   camisa: "camiseta",
   camisas: "camiseta",
+  playera: "camiseta",
+  playeras: "camiseta",
   oversize: "camiseta",
   oversized: "camiseta",
   accessory: "gorra",
@@ -533,17 +780,14 @@ const SUPPORTED_KEYWORDS = [
 const OPERATION_WORDS = [
   "agregame",
   "agrega",
-  "agrega",
   "agregale",
   "sumale",
   "suma",
   "quitame",
   "quita",
-  "quitá",
   "sacame",
   "saca",
   "dejame",
-  "deja",
   "solo",
   "quiero",
   "dame",
@@ -552,5 +796,12 @@ const OPERATION_WORDS = [
   "mejor",
   "sabes",
   "que",
+  "ya",
+  "la",
+  "el",
+  "las",
+  "los",
+  "otras",
+  "otros",
   "por"
 ];

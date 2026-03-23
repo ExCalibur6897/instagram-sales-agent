@@ -79,8 +79,20 @@ class MessageService {
       classification,
       memory
     );
+    const purchaseMessage = stripSecondaryProductClause(input.message);
+    const requestedItems = await extractPurchaseItems(purchaseMessage);
+    const cartOperations =
+      pendingState &&
+      (this.hasActiveCartItems(pendingState) ||
+        (pendingState.pendingItems ?? []).length > 0)
+        ? await extractCartOperations(input.message)
+        : [];
 
-    if (pendingState && isCheckoutCancellationMessage(input.message)) {
+    if (
+      pendingState &&
+      cartOperations.length === 0 &&
+      isCheckoutCancellationMessage(input.message)
+    ) {
       return this.buildCheckoutCancellationResponse(input.userId, input.message);
     }
 
@@ -115,6 +127,17 @@ class MessageService {
     }
 
     if (pendingState?.nextStep === "clarify_cart_items") {
+      if (cartOperations.length > 0) {
+        return this.handlePendingCartOperations(
+          input,
+          pendingState,
+          cartOperations,
+          classification,
+          extractedIntents,
+          memory
+        );
+      }
+
       return this.handlePendingCartClarification(
         input,
         pendingState,
@@ -129,11 +152,18 @@ class MessageService {
       return this.handleOrderDataCollection(input, pendingState);
     }
 
-    const requestedItems = await extractPurchaseItems(input.message);
-    const cartOperations =
-      pendingState && this.hasActiveCartItems(pendingState)
-        ? await extractCartOperations(input.message)
-        : [];
+    if (
+      pendingState?.nextStep === "collect_order_data" &&
+      this.hasActiveCartItems(pendingState) &&
+      this.shouldReduceSingleCartItem(pendingState, input.message, classification)
+    ) {
+      return this.handleSingleCartItemReduction(
+        input,
+        pendingState,
+        classification,
+        extractedIntents
+      );
+    }
 
     if (
       pendingState?.nextStep === "collect_order_data" &&
@@ -145,7 +175,8 @@ class MessageService {
         pendingState,
         cartOperations,
         classification,
-        extractedIntents
+        extractedIntents,
+        memory
       );
     }
 
@@ -160,6 +191,20 @@ class MessageService {
         classification,
         requestedItems,
         extractedIntents
+      );
+    }
+
+    if (
+      pendingState?.nextStep === "collect_order_data" &&
+      this.hasActiveCartItems(pendingState) &&
+      this.looksLikeCartReferenceMessage(input.message, classification)
+    ) {
+      return this.handleActiveCartReference(
+        input,
+        pendingState,
+        classification,
+        extractedIntents,
+        memory
       );
     }
 
@@ -405,7 +450,7 @@ class MessageService {
       intent: "buying_intent",
       productFound: true,
       agentReply:
-        "Perfecto, ya tengo tus datos. Alguien del equipo te escribirá en breve para finalizar la compra 🙌",
+        "Perfecto, ya tengo tus datos. Alguien del equipo te escribir\u00e1 en breve para finalizar la compra \ud83d\ude4c",
       usedOpenAI: openAiClient.isConfigured(),
       handoff: true
     };
@@ -488,12 +533,41 @@ class MessageService {
     pendingState: CheckoutState,
     operations: CartOperation[],
     classification: IntentClassification,
-    extractedIntents: IntentName[]
+    extractedIntents: IntentName[],
+    memory: ConversationMemory
   ): Promise<MessageResponse> {
     let cartItems = [...(pendingState.items ?? [])];
+    let keepOnlyApplied = false;
+    const sortedOperations = [...operations].sort((left, right) => {
+      if (left.operation === "keep_only_item" && right.operation !== "keep_only_item") {
+        return -1;
+      }
 
-    for (const operation of operations) {
-      const result = await this.applyCartOperation(cartItems, operation);
+      if (right.operation === "keep_only_item" && left.operation !== "keep_only_item") {
+        return 1;
+      }
+
+      if (left.refersToOthers && !right.refersToOthers) {
+        return 1;
+      }
+
+      if (right.refersToOthers && !left.refersToOthers) {
+        return -1;
+      }
+
+      return 0;
+    });
+
+    for (const operation of sortedOperations) {
+      if (
+        keepOnlyApplied &&
+        operation.operation === "remove_item" &&
+        operation.refersToOthers
+      ) {
+        continue;
+      }
+
+      const result = await this.applyCartOperation(cartItems, operation, memory);
 
       if (result.type === "clarification") {
         checkoutStateService.set(input.userId, {
@@ -524,6 +598,15 @@ class MessageService {
       }
 
       cartItems = result.cartItems;
+      if (operation.operation === "keep_only_item") {
+        keepOnlyApplied = true;
+      } else if (
+        operation.operation === "update_quantity" &&
+        operation.useContextTarget &&
+        operation.refersToOthers
+      ) {
+        keepOnlyApplied = true;
+      }
     }
 
     if (cartItems.length === 0) {
@@ -540,10 +623,236 @@ class MessageService {
         intent: "buying_intent",
         productFound: false,
         agentReply: this.decorateReplyWithSecondaryIntents(
-          "Perfecto, actualice tu pedido. Tu carrito quedo vacio. Si queres, te ayudo a armar otro 🙌",
+          "Perfecto, actualic\u00e9 tu pedido. Tu carrito qued\u00f3 vac\u00edo. Si quer\u00e9s, te ayudo a armar otro \ud83d\ude4c",
           classification,
           extractedIntents,
           false,
+          input.message
+        ),
+        usedOpenAI: openAiClient.isConfigured(),
+        handoff: false
+      };
+    }
+
+    this.persistCheckoutCart(input.userId, cartItems);
+
+    return {
+      channel: "instagram",
+      userMessage: input.message,
+      intent: "buying_intent",
+      productFound: true,
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildCartModifiedReply(cartItems),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
+      usedOpenAI: openAiClient.isConfigured(),
+      handoff: true,
+      nextStep: "collect_order_data"
+    };
+  }
+
+  private async handlePendingCartOperations(
+    input: HandleMessageInput,
+    pendingState: CheckoutState,
+    operations: CartOperation[],
+    classification: IntentClassification,
+    extractedIntents: IntentName[],
+    memory: ConversationMemory
+  ): Promise<MessageResponse> {
+    let cartItems = [...(pendingState.items ?? [])];
+    let pendingItems = [...(pendingState.pendingItems ?? [])];
+    let keepOnlyApplied = false;
+    const sortedOperations = [...operations].sort((left, right) => {
+      if (left.operation === "keep_only_item" && right.operation !== "keep_only_item") {
+        return -1;
+      }
+
+      if (right.operation === "keep_only_item" && left.operation !== "keep_only_item") {
+        return 1;
+      }
+
+      if (left.refersToOthers && !right.refersToOthers) {
+        return 1;
+      }
+
+      if (right.refersToOthers && !left.refersToOthers) {
+        return -1;
+      }
+
+      return 0;
+    });
+
+    for (const operation of sortedOperations) {
+      if (
+        keepOnlyApplied &&
+        operation.operation === "remove_item" &&
+        operation.refersToOthers
+      ) {
+        continue;
+      }
+
+      const pendingMatches = this.resolvePendingOperationMatches(
+        pendingItems,
+        operation
+      );
+
+      if (pendingMatches.length === 1) {
+        const targetPendingItem = pendingMatches[0];
+
+        if (operation.operation === "remove_item") {
+          pendingItems = removePendingItemQuantity(
+            pendingItems,
+            targetPendingItem,
+            operation.quantity
+          );
+          continue;
+        }
+
+        if (operation.operation === "update_quantity") {
+          pendingItems = updatePendingItemQuantity(
+            pendingItems,
+            targetPendingItem,
+            operation.quantity ?? 1
+          );
+          continue;
+        }
+
+        if (operation.operation === "keep_only_item") {
+          const nextQuantity = operation.quantity ?? targetPendingItem.quantity;
+
+          cartItems = [];
+          pendingItems = [
+            {
+              ...targetPendingItem,
+              quantity: nextQuantity
+            }
+          ];
+          keepOnlyApplied = true;
+          continue;
+        }
+
+        if (operation.operation === "replace_item" && operation.replacementItem) {
+          const replacementItem: PendingCartItem = {
+            productName: operation.replacementItem.productName,
+            category: operation.replacementItem.category,
+            color: operation.replacementItem.color,
+            quantity:
+              operation.replacementItem.quantity > 0
+                ? operation.replacementItem.quantity
+                : targetPendingItem.quantity,
+            keywords: operation.replacementItem.keywords
+          };
+          const remainingPendingItems = pendingItems.filter(
+            (item) => item !== targetPendingItem
+          );
+          const replacementResolution = this.resolvePurchaseItems([replacementItem]);
+
+          pendingItems = [
+            ...remainingPendingItems,
+            ...replacementResolution.pendingItems
+          ];
+          cartItems = mergeCheckoutCartItems(
+            cartItems,
+            replacementResolution.resolvedItems.map((item) => item.cartItem)
+          );
+          continue;
+        }
+      }
+
+      const result = await this.applyCartOperation(cartItems, operation, memory);
+
+      if (result.type === "clarification") {
+        if (operation.operation === "add_item") {
+          pendingItems = [...pendingItems, result.pendingItem];
+          continue;
+        }
+
+        checkoutStateService.set(input.userId, {
+          nextStep: "clarify_cart_items",
+          items: cartItems,
+          pendingItems: [result.pendingItem, ...pendingItems]
+        });
+
+        return {
+          channel: "instagram",
+          userMessage: input.message,
+          intent: "buying_intent",
+          productFound: cartItems.length > 0,
+          agentReply: this.decorateReplyWithSecondaryIntents(
+            buildCartOperationClarificationReply(
+              cartItems,
+              result.pendingItem,
+              operation.operation
+            ),
+            classification,
+            extractedIntents,
+            cartItems.length > 0,
+            input.message
+          ),
+          usedOpenAI: openAiClient.isConfigured(),
+          handoff: false
+        };
+      }
+
+      cartItems = result.cartItems;
+
+      if (operation.operation === "keep_only_item") {
+        keepOnlyApplied = true;
+        pendingItems = [];
+      } else if (
+        operation.operation === "update_quantity" &&
+        operation.useContextTarget &&
+        operation.refersToOthers
+      ) {
+        keepOnlyApplied = true;
+      }
+    }
+
+    if (cartItems.length === 0 && pendingItems.length === 0) {
+      checkoutStateService.clear(input.userId);
+      conversationMemoryService.remember(input.userId, {
+        purchaseIntentActive: false,
+        candidateProducts: [],
+        product: null
+      });
+
+      return {
+        channel: "instagram",
+        userMessage: input.message,
+        intent: "buying_intent",
+        productFound: false,
+        agentReply: this.decorateReplyWithSecondaryIntents(
+          "Perfecto, actualic\u00e9 tu pedido. Tu carrito qued\u00f3 vac\u00edo. Si quer\u00e9s, te ayudo a armar otro \ud83d\ude4c",
+          classification,
+          extractedIntents,
+          false,
+          input.message
+        ),
+        usedOpenAI: openAiClient.isConfigured(),
+        handoff: false
+      };
+    }
+
+    if (pendingItems.length > 0) {
+      checkoutStateService.set(input.userId, {
+        nextStep: "clarify_cart_items",
+        items: cartItems,
+        pendingItems
+      });
+
+      return {
+        channel: "instagram",
+        userMessage: input.message,
+        intent: "buying_intent",
+        productFound: cartItems.length > 0,
+        agentReply: this.decorateReplyWithSecondaryIntents(
+          buildPartialCartClarificationReply(cartItems, pendingItems[0]),
+          classification,
+          extractedIntents,
+          cartItems.length > 0,
           input.message
         ),
         usedOpenAI: openAiClient.isConfigured(),
@@ -644,7 +953,8 @@ class MessageService {
 
   private async applyCartOperation(
     currentCartItems: CheckoutCartItem[],
-    operation: CartOperation
+    operation: CartOperation,
+    memory: ConversationMemory
   ): Promise<
     | { type: "success"; cartItems: CheckoutCartItem[] }
     | { type: "clarification"; pendingItem: PendingCartItem }
@@ -669,15 +979,28 @@ class MessageService {
       };
     }
 
-    const matchedCartItems = this.findCartMatches(
+    const operationTarget = this.toPendingCartItem(operation);
+    const matchedCartItems = this.resolveCartOperationMatches(
       currentCartItems,
-      this.toPendingCartItem(operation)
+      operation,
+      memory
     );
+
+    if (
+      operation.operation === "remove_item" &&
+      matchedCartItems.length > 1 &&
+      shouldRemoveMatchedGroup(operation)
+    ) {
+      return {
+        type: "success",
+        cartItems: removeCartItemGroup(currentCartItems, matchedCartItems)
+      };
+    }
 
     if (matchedCartItems.length !== 1) {
       return {
         type: "clarification",
-        pendingItem: this.toPendingCartItem(operation)
+        pendingItem: operationTarget
       };
     }
 
@@ -705,12 +1028,36 @@ class MessageService {
       };
     }
 
+    if (operation.operation === "keep_only_item") {
+      const nextQuantity = operation.quantity ?? targetCartItem.quantity;
+
+      if (operation.useContextTarget && operation.quantity !== null) {
+        return {
+          type: "success",
+          cartItems: updateCartItemQuantity(
+            currentCartItems,
+            targetCartItem,
+            nextQuantity
+          )
+        };
+      }
+
+      return {
+        type: "success",
+        cartItems: [
+          {
+            ...targetCartItem,
+            quantity: nextQuantity,
+            subtotal: nextQuantity * targetCartItem.unitPrice
+          }
+        ]
+      };
+    }
+
     const replacementItem = operation.replacementItem
       ? {
           ...operation.replacementItem,
-          category:
-            operation.replacementItem.category ??
-            this.toPendingCartItem(operation).category,
+          category: operation.replacementItem.category ?? operationTarget.category,
           quantity:
             operation.replacementItem.quantity > 0
               ? operation.replacementItem.quantity
@@ -721,7 +1068,7 @@ class MessageService {
     if (!replacementItem) {
       return {
         type: "clarification",
-        pendingItem: this.toPendingCartItem(operation)
+        pendingItem: operationTarget
       };
     }
 
@@ -764,7 +1111,7 @@ class MessageService {
         intent: "unknown",
         productFound: false,
         agentReply:
-          "Se perdió el detalle pendiente de la compra. Si querés, decime los productos de nuevo y lo retomamos.",
+          "Se perdi\u00f3 el detalle pendiente de la compra. Si quer\u00e9s, decime los productos de nuevo y lo retomamos.",
         usedOpenAI: openAiClient.isConfigured(),
         handoff: false
       };
@@ -1012,11 +1359,167 @@ class MessageService {
     });
   }
 
+  private shouldReduceSingleCartItem(
+    pendingState: CheckoutState,
+    message: string,
+    classification: IntentClassification
+  ): boolean {
+    const cartItems = pendingState.items ?? [];
+    const normalized = normalizeResumeMessage(message);
+
+    return (
+      cartItems.length === 1 &&
+      Boolean(classification.quantity) &&
+      (normalized.includes("solo quiero") ||
+        normalized.includes("ya solo quiero") ||
+        normalized.includes("dejame solo"))
+    );
+  }
+
+  private handleSingleCartItemReduction(
+    input: HandleMessageInput,
+    pendingState: CheckoutState,
+    classification: IntentClassification,
+    extractedIntents: IntentName[]
+  ): MessageResponse {
+    const currentItem = pendingState.items?.[0];
+
+    if (!currentItem) {
+      return this.buildPendingCartResponse(input, pendingState);
+    }
+
+    const nextQuantity = classification.quantity ?? 1;
+    const updatedCartItems = [
+      {
+        ...currentItem,
+        quantity: nextQuantity,
+        subtotal: nextQuantity * currentItem.unitPrice
+      }
+    ];
+
+    this.persistCheckoutCart(input.userId, updatedCartItems);
+
+    return {
+      channel: "instagram",
+      userMessage: input.message,
+      intent: "buying_intent",
+      productFound: true,
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildCartModifiedReply(updatedCartItems),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
+      usedOpenAI: openAiClient.isConfigured(),
+      handoff: true,
+      nextStep: "collect_order_data"
+    };
+  }
+
+  private resolveCartOperationMatches(
+    cartItems: CheckoutCartItem[],
+    operation: CartOperation,
+    memory: ConversationMemory
+  ): CheckoutCartItem[] {
+    const targetItem = this.toPendingCartItem(operation);
+    const hasExplicitTarget = Boolean(
+      targetItem.productName ||
+        targetItem.category ||
+        targetItem.color ||
+        targetItem.keywords.length > 0
+    );
+    const directMatches = hasExplicitTarget
+      ? this.findCartMatches(cartItems, targetItem)
+      : [];
+
+    if (directMatches.length > 0 || !operation.useContextTarget) {
+      return directMatches;
+    }
+
+    const focusedCartItem = this.getFocusedCartItem(cartItems, memory);
+    if (focusedCartItem) {
+      return [focusedCartItem];
+    }
+
+    if (cartItems.length === 1) {
+      return cartItems;
+    }
+
+    const multiQuantityMatches = cartItems.filter((item) => item.quantity > 1);
+    if (multiQuantityMatches.length === 1) {
+      return multiQuantityMatches;
+    }
+
+    if (operation.refersToOthers) {
+      return [];
+    }
+
+    return [];
+  }
+
+  private getFocusedCartItem(
+    cartItems: CheckoutCartItem[],
+    memory: ConversationMemory
+  ): CheckoutCartItem | null {
+    const focusedProductId = memory.lastMentionedProduct?.id;
+
+    if (!focusedProductId) {
+      return null;
+    }
+
+    return cartItems.find((item) => item.productId === focusedProductId) ?? null;
+  }
+
+  private resolvePendingOperationMatches(
+    pendingItems: PendingCartItem[],
+    operation: CartOperation
+  ): PendingCartItem[] {
+    const targetItem = this.toPendingCartItem(operation);
+    const hasExplicitTarget = Boolean(
+      targetItem.productName ||
+        targetItem.category ||
+        targetItem.color ||
+        targetItem.keywords.length > 0
+    );
+    const directMatches = hasExplicitTarget
+      ? pendingItems.filter((pendingItem) =>
+          matchesPendingOperationTarget(pendingItem, targetItem)
+        )
+      : [];
+
+    if (directMatches.length > 0 || !operation.useContextTarget) {
+      return directMatches;
+    }
+
+    if (pendingItems.length === 1) {
+      return pendingItems;
+    }
+
+    const multiQuantityMatches = pendingItems.filter((item) => item.quantity > 1);
+    if (multiQuantityMatches.length === 1) {
+      return multiQuantityMatches;
+    }
+
+    if (operation.refersToOthers) {
+      return [];
+    }
+
+    return [];
+  }
+
   private shouldAppendToActiveCart(
     message: string,
     classification: IntentClassification,
     requestedItems: PurchaseItemInput[]
   ): boolean {
+    if (
+      isShortReferenceMessage(message) &&
+      !looksLikeDirectBuyingMessage(message)
+    ) {
+      return false;
+    }
+
     if (looksLikeCartAppendMessage(message)) {
       return true;
     }
@@ -1025,6 +1528,137 @@ class MessageService {
       classification.intent === "buying_intent" &&
       requestedItems.length > 0
     );
+  }
+
+  private looksLikeCartReferenceMessage(
+    message: string,
+    classification: IntentClassification
+  ): boolean {
+    const normalized = normalizeResumeMessage(message);
+
+    if (
+      this.isFaqIntent(classification) ||
+      classification.intent === "greeting" ||
+      looksLikeResumePurchaseMessage(message) ||
+      looksLikeOrderDataMessage(message) ||
+      looksLikeCartAppendMessage(message) ||
+      hasExplicitCartOperationLanguage(normalized) ||
+      looksLikeDirectBuyingMessage(message)
+    ) {
+      return false;
+    }
+
+    return Boolean(
+      classification.refersToPreviousProduct ||
+        classification.productName ||
+        classification.category ||
+        classification.color ||
+        isCandidateSelectionReference(message) ||
+        normalized.startsWith("la ") ||
+        normalized.startsWith("el ")
+    );
+  }
+
+  private handleActiveCartReference(
+    input: HandleMessageInput,
+    pendingState: CheckoutState,
+    classification: IntentClassification,
+    extractedIntents: IntentName[],
+    memory: ConversationMemory
+  ): MessageResponse {
+    const cartItems = pendingState.items ?? [];
+    const matches = this.resolveCartReferenceMatches(
+      cartItems,
+      classification,
+      input.message,
+      memory
+    );
+
+    if (matches.length > 1) {
+      return {
+        channel: "instagram",
+        userMessage: input.message,
+        intent: "buying_intent",
+        productFound: true,
+        agentReply: buildCartReferenceClarificationReply(matches),
+        usedOpenAI: openAiClient.isConfigured(),
+        handoff: false
+      };
+    }
+
+    if (matches.length === 0) {
+      return this.buildPendingCartResponse(input, pendingState);
+    }
+
+    const focusedCartItem = matches[0];
+    const focusedProduct =
+      inventoryService.findById(focusedCartItem.productId) ?? null;
+
+    if (focusedProduct) {
+      conversationMemoryService.remember(input.userId, {
+        product: focusedProduct,
+        candidateProducts: [focusedProduct],
+        purchaseIntentActive: true
+      });
+    }
+
+    return {
+      channel: "instagram",
+      userMessage: input.message,
+      intent: "buying_intent",
+      productFound: true,
+      agentReply: this.decorateReplyWithSecondaryIntents(
+        buildCartReferenceReply(focusedCartItem),
+        classification,
+        extractedIntents,
+        true,
+        input.message
+      ),
+      usedOpenAI: openAiClient.isConfigured(),
+      handoff: true,
+      nextStep: "collect_order_data"
+    };
+  }
+
+  private resolveCartReferenceMatches(
+    cartItems: CheckoutCartItem[],
+    classification: IntentClassification,
+    message: string,
+    memory: ConversationMemory
+  ): CheckoutCartItem[] {
+    if (cartItems.length === 0) {
+      return [];
+    }
+
+    const referenceItem: PendingCartItem = {
+      productName: classification.productName,
+      category: classification.category,
+      color: classification.color,
+      quantity: classification.quantity ?? 1,
+      keywords: []
+    };
+    const directMatches = this.findCartMatches(cartItems, referenceItem);
+
+    if (directMatches.length > 0) {
+      return directMatches;
+    }
+
+    if (
+      (classification.refersToPreviousProduct || isCandidateSelectionReference(message)) &&
+      memory.lastMentionedProduct
+    ) {
+      const focusedCartItem = this.getFocusedCartItem(cartItems, memory);
+
+      if (focusedCartItem) {
+        return [focusedCartItem];
+      }
+    }
+
+    if (cartItems.length === 1 && isShortReferenceMessage(message)) {
+      return cartItems;
+    }
+
+    return [];
   }
 
   private applyConversationContext(
@@ -1245,21 +1879,43 @@ class MessageService {
       .slice(0, 3) as IntentName[];
     const parts: string[] = [];
 
-    if (secondaryIntents.includes("greeting")) {
+    if (
+      secondaryIntents.includes("greeting") &&
+      classification.intent !== "buying_intent"
+    ) {
       parts.push(buildGreetingLead(message, classification.tone));
     }
 
     parts.push(baseReply);
 
+    const secondaryProductReply = this.buildSecondaryProductReply(
+      message,
+      classification,
+      secondaryIntents
+    );
+    if (secondaryProductReply) {
+      parts.push(secondaryProductReply);
+    }
+
     for (const intent of secondaryIntents) {
-      if (!isFaqIntentName(intent)) {
+      if (
+        !isFaqIntentName(intent) ||
+        intent === "product_search" ||
+        intent === "collection_request" ||
+        intent === "price_question" ||
+        intent === "product_availability"
+      ) {
         continue;
       }
 
       const faqIntents = secondaryIntents.filter(isFaqIntentName);
 
       if (classification.intent === "buying_intent" && faqIntents.length > 0) {
-        parts.push(buildFaqSummaryReply(faqIntents));
+        parts.push(
+          buildFaqSummaryReply(faqIntents, {
+            isSameTurnBuyingIntent: true
+          })
+        );
         break;
       }
 
@@ -1277,6 +1933,66 @@ class MessageService {
     }
 
     return [...new Set(parts.filter(Boolean))].join("\n");
+  }
+
+  private buildSecondaryProductReply(
+    message: string,
+    classification: IntentClassification,
+    secondaryIntents: IntentName[]
+  ): string | null {
+    if (
+      !secondaryIntents.some((intent) =>
+        [
+          "product_search",
+          "collection_request",
+          "price_question",
+          "product_availability"
+        ].includes(intent)
+      )
+    ) {
+      return null;
+    }
+
+    const queryClause = extractSecondaryProductClause(message);
+    if (!queryClause) {
+      return null;
+    }
+
+    const category = normalizeCategoryLabel(inferCategoryFromMessage(queryClause));
+    const color = normalizeColorLabel(inferColorFromMessage(queryClause));
+    const productName = category ? null : buildSecondaryProductHint(queryClause);
+    const searchResult = inventoryService.findMatch({
+      productName,
+      category,
+      color
+    });
+
+    if (searchResult.product) {
+      return `Y sobre eso, ${searchResult.product.name} cuesta ${searchResult.product.price} ${searchResult.product.currency}.`;
+    }
+
+    if (searchResult.products.length > 0) {
+      const items = searchResult.products
+        .slice(0, 4)
+        .map((item) => `${item.name} (${item.price} ${item.currency})`)
+        .join(", ");
+      const intro =
+        category && color
+          ? `Y en ${pluralizeCategory(category)} ${normalizeDisplayColor(color)} tenemos`
+          : category
+            ? `Y de ${pluralizeCategory(category)} tenemos`
+            : color
+              ? `Y en ${normalizeDisplayColor(color)} tenemos`
+              : "Y también tenemos";
+
+      return `${intro}: ${items}.`;
+    }
+
+    if (classification.intent === "buying_intent") {
+      return "Sobre esa otra consulta, si querés decime el producto exacto y te lo ubico rápido.";
+    }
+
+    return null;
   }
 
   private resolvePurchaseIntentActive(
@@ -1338,6 +2054,7 @@ class MessageService {
 
     if (
       lastListedProducts.length === 0 ||
+      (classification.isListRequest && Boolean(classification.category)) ||
       (!classification.category &&
         !classification.color &&
         !classification.productName &&
@@ -1423,6 +2140,15 @@ class MessageService {
     hasPendingPurchaseContext: boolean,
     extractedIntents: string[]
   ): MessageResponse {
+    const faqIntents = [
+      classification.intent,
+      ...(extractedIntents as IntentName[])
+    ];
+    const uniqueFaqIntents = [...new Set(faqIntents.filter(isFaqIntentName))];
+    const secondaryNonFaqIntents = extractedIntents.filter(
+      (intent) => !isFaqIntentName(intent as IntentName)
+    ) as IntentName[];
+
     conversationMemoryService.remember(userId, {
       intent: classification.intent
     });
@@ -1433,14 +2159,15 @@ class MessageService {
       intent: classification.intent,
       productFound: false,
       agentReply: this.decorateReplyWithSecondaryIntents(
-        buildFaqReply(
-          classification,
-          {
-            hasPendingPurchaseContext
-          }
-        ),
+        uniqueFaqIntents.length > 1
+          ? buildFaqSummaryReply(uniqueFaqIntents, {
+              hasPendingPurchaseContext
+            })
+          : buildFaqReply(classification, {
+              hasPendingPurchaseContext
+            }),
         classification,
-        extractedIntents,
+        secondaryNonFaqIntents,
         hasPendingPurchaseContext,
         message
       ),
@@ -1502,7 +2229,7 @@ export const messageService = new MessageService();
 
 function buildClarificationReply(alternatives: { name: string }[]): string {
   const names = alternatives.map((item) => item.name).join(", ");
-  return `Quiero asegurarme de darte el producto correcto. ¿Te refieres a ${names}?`;
+  return `Quiero asegurarme de darte el producto correcto. ¿Te refer\u00eds a ${names}?`;
 }
 
 function buildMissingDataReply(data: {
@@ -1517,11 +2244,11 @@ function buildMissingDataReply(data: {
   }
 
   if (!data.address) {
-    missingFields.push("tu dirección de entrega");
+    missingFields.push("tu direcci\u00f3n de entrega");
   }
 
   if (!data.paymentMethod) {
-    missingFields.push("tu método de pago preferido");
+    missingFields.push("tu m\u00e9todo de pago preferido");
   }
 
   return `Para seguir con tu compra, compartime ${joinFieldList(missingFields)}.`;
@@ -1543,23 +2270,24 @@ function buildBuyingClarificationReply(
   classification: IntentClassification
 ): string {
   if (classification.quantity) {
-    return "Claro, te ayudo con la compra. Decime qué producto quieres llevar para aplicar esa cantidad.";
+    return "Claro, te ayudo con la compra. Decime qu\u00e9 producto quer\u00e9s llevar para aplicar esa cantidad.";
   }
 
-  return "Claro, te ayudo con la compra. Decime cuál producto te interesa para seguir.";
+  return "Claro, te ayudo con la compra. Decime cu\u00e1l producto te interesa para seguir.";
 }
 
 function looksLikeOrderDataMessage(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const looksLikeCartEdit =
     looksLikeResumePurchaseMessage(message) ||
     looksLikeCartAppendMessage(message) ||
     normalized.includes("sabes que") ||
-    normalized.includes("sabés que") ||
     normalized.includes("mejor") ||
     normalized.includes("quit") ||
     normalized.includes("cambi") ||
     normalized.includes("dejame solo") ||
+    normalized.includes("solo quiero") ||
+    normalized.includes("ya solo quiero") ||
     Boolean(inferCategoryFromMessage(message)) ||
     Boolean(inferColorFromMessage(message));
 
@@ -1577,7 +2305,7 @@ function looksLikeOrderDataMessage(message: string): boolean {
 }
 
 function inferCategoryFromMessage(message: string): string | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const categoryAliases: Record<string, string> = {
     hoodie: "hoodie",
     hoodies: "hoodie",
@@ -1591,6 +2319,8 @@ function inferCategoryFromMessage(message: string): string | null {
     camisetas: "camiseta",
     camisa: "camiseta",
     camisas: "camiseta",
+    playera: "camiseta",
+    playeras: "camiseta",
     gorra: "gorra",
     gorras: "gorra",
     polo: "polo",
@@ -1608,7 +2338,7 @@ function inferCategoryFromMessage(message: string): string | null {
 }
 
 function inferColorFromMessage(message: string): string | null {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const colorAliases: Record<string, string> = {
     negro: "negro",
     negra: "negro",
@@ -1633,6 +2363,16 @@ function normalizeCategoryLabel(category: string | null): string | null {
     return null;
   }
 
+  const normalizedCategory = normalizeResumeMessage(category);
+
+  if (
+    normalizedCategory === "ropa" ||
+    normalizedCategory === "clothing" ||
+    normalizedCategory === "prenda"
+  ) {
+    return null;
+  }
+
   const aliases: Record<string, string> = {
     hoodie: "hoodie",
     hoodies: "hoodie",
@@ -1644,6 +2384,10 @@ function normalizeCategoryLabel(category: string | null): string | null {
     yugers: "jogger",
     camiseta: "camiseta",
     camisetas: "camiseta",
+    camisa: "camiseta",
+    camisas: "camiseta",
+    playera: "camiseta",
+    playeras: "camiseta",
     gorra: "gorra",
     gorras: "gorra",
     polo: "polo",
@@ -1656,7 +2400,7 @@ function normalizeCategoryLabel(category: string | null): string | null {
     pantalonetas: "short"
   };
 
-  return aliases[category.toLowerCase()] ?? category.toLowerCase();
+  return aliases[normalizedCategory] ?? normalizedCategory;
 }
 
 function normalizeColorLabel(color: string | null): string | null {
@@ -1709,37 +2453,37 @@ function normalizeDisplayColor(color: string): string {
 }
 
 function buildGreetingReply(message: string, tone: string): string {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const isCasual =
     tone === "casual" ||
     normalized.includes("bro") ||
     normalized.includes("man") ||
     normalized.includes("q ondas") ||
-    normalized.includes("qué ondas");
+    normalized.includes("que ondas");
 
   if (isCasual) {
-    return "¡Buenas! Decime qué producto andás buscando y te ayudo.";
+    return "\u00a1Buenas! Decime qu\u00e9 producto and\u00e1s buscando y te ayudo.";
   }
 
   if (normalized.includes("buenas")) {
-    return "¡Buenas! Si quieres, te puedo ayudar con productos, precios o disponibilidad.";
+    return "\u00a1Buenas! Si quer\u00e9s, te puedo ayudar con productos, precios o disponibilidad.";
   }
 
-  return "¡Hola! 👋 ¿En qué te puedo ayudar hoy?";
+  return "\u00a1Hola! \ud83d\udc4b \u00bfEn qu\u00e9 te puedo ayudar hoy?";
 }
 
 function buildGreetingLead(message: string, tone: string): string {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const isCasual =
     tone === "casual" ||
     normalized.includes("bro") ||
     normalized.includes("man");
 
-  return isCasual ? "Â¡Buenas!" : "Â¡Hola!";
+  return isCasual ? "\u00a1Buenas!" : "\u00a1Hola!";
 }
 
 function looksLikeGreetingMessage(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
 
   return (
     normalized.includes("hola") ||
@@ -1816,36 +2560,47 @@ function isFaqIntentName(intent: IntentName): boolean {
   ].includes(intent);
 }
 
-function buildFaqSummaryReply(intents: IntentName[]): string {
+function buildFaqSummaryReply(
+  intents: IntentName[],
+  options: {
+    hasPendingPurchaseContext?: boolean;
+    isSameTurnBuyingIntent?: boolean;
+  } = {}
+): string {
   const faqLabels = intents
     .filter(isFaqIntentName)
     .map((intent) => mapFaqIntentToLabel(intent));
+  const suffix = options.isSameTurnBuyingIntent
+    ? ""
+    : options.hasPendingPurchaseContext
+      ? " Si quer\u00e9s, seguimos con tu pedido \ud83d\ude4c"
+      : "";
 
   if (faqLabels.length === 0) {
     return "";
   }
 
   if (faqLabels.length === 1) {
-    return `Sobre ${faqLabels[0]}, el equipo te confirma ese detalle por este medio.`;
+    return `Sobre ${faqLabels[0]}, el equipo te confirma ese detalle por este medio.${suffix}`;
   }
 
   if (faqLabels.length === 2) {
-    return `Sobre ${faqLabels[0]} y ${faqLabels[1]}, el equipo te confirma esos detalles por este medio.`;
+    return `Sobre ${faqLabels[0]} y ${faqLabels[1]}, el equipo te confirma esos detalles por este medio.${suffix}`;
   }
 
-  return `Sobre ${faqLabels.slice(0, -1).join(", ")} y ${faqLabels[faqLabels.length - 1]}, el equipo te confirma esos detalles por este medio.`;
+  return `Sobre ${faqLabels.slice(0, -1).join(", ")} y ${faqLabels[faqLabels.length - 1]}, el equipo te confirma esos detalles por este medio.${suffix}`;
 }
 
 function mapFaqIntentToLabel(intent: IntentName): string {
   switch (intent) {
     case "faq_location":
-      return "ubicacion";
+      return "ubicaci\u00f3n";
     case "faq_hours":
       return "horario";
     case "faq_payment":
-      return "metodos de pago";
+      return "m\u00e9todos de pago";
     case "faq_shipping":
-      return "envios";
+      return "env\u00edos";
     default:
       return "ese detalle";
   }
@@ -1892,8 +2647,49 @@ function detectFaqIntentsFromMessage(message: string): IntentName[] {
   return [...new Set(intents)];
 }
 
+function extractSecondaryProductClause(message: string): string | null {
+  const clauses = message
+    .split(/,|\sy\s/gi)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  return (
+    clauses.find((clause) => {
+      const normalized = normalizeResumeMessage(clause);
+      return (
+        (normalized.includes("dime") ||
+          normalized.includes("que ") ||
+          normalized.includes("tienen") ||
+          normalized.includes("muestra") ||
+          normalized.includes("mostra")) &&
+        !detectFaqIntentsFromMessage(clause).length
+      );
+    }) ?? null
+  );
+}
+
+function stripSecondaryProductClause(message: string): string {
+  const queryClause = extractSecondaryProductClause(message);
+
+  if (!queryClause) {
+    return message;
+  }
+
+  return message.replace(queryClause, "").replace(/\s+,/g, ",").trim();
+}
+
+function buildSecondaryProductHint(message: string): string | null {
+  const normalized = normalizeResumeMessage(message);
+  const hint = normalized
+    .replace(/\b(dime|decime|que|que tienen|tienen|muestra|mostra|tambien|tambien quiero|y)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return hint.length > 0 ? hint : null;
+}
+
 function looksLikePurchaseIntentMessage(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
 
   return (
     normalized.includes("quiero comprar") ||
@@ -1904,7 +2700,7 @@ function looksLikePurchaseIntentMessage(message: string): boolean {
 }
 
 function looksLikeCartAppendMessage(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
 
   return (
     normalized.includes("tambien") ||
@@ -1916,6 +2712,24 @@ function looksLikeCartAppendMessage(message: string): boolean {
     normalized.includes("suma") ||
     normalized.includes("dame") ||
     normalized.includes("poneme")
+  );
+}
+
+function hasExplicitCartOperationLanguage(message: string): boolean {
+  return (
+    message.includes("agreg") ||
+    message.includes("suma") ||
+    message.includes("quita") ||
+    message.includes("quitame") ||
+    message.includes("saca") ||
+    message.includes("ya no quiero") ||
+    message.includes("solo quiero") ||
+    message.includes("ya solo quiero") ||
+    message.includes("dejame") ||
+    message.includes("unicamente") ||
+    message.includes("todo menos") ||
+    message.includes("cambia") ||
+    message.includes("cambiame")
   );
 }
 
@@ -1958,18 +2772,31 @@ function looksLikeResumePurchaseMessage(message: string): boolean {
 }
 
 function isCandidateSelectionReference(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
 
   return (
     normalized.includes("uno") ||
     normalized.includes("dos") ||
     normalized.includes("esa") ||
-    normalized.includes("ese")
+    normalized.includes("ese") ||
+    normalized.includes("eso")
+  );
+}
+
+function isShortReferenceMessage(message: string): boolean {
+  const normalized = normalizeResumeMessage(message);
+
+  return (
+    normalized.startsWith("la ") ||
+    normalized.startsWith("el ") ||
+    normalized.startsWith("esa") ||
+    normalized.startsWith("ese") ||
+    normalized.startsWith("eso")
   );
 }
 
 function isCheckoutCancellationMessage(message: string): boolean {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
   const cancellationPhrases = [
     "ya no",
     "ya no man",
@@ -1986,21 +2813,33 @@ function isCheckoutCancellationMessage(message: string): boolean {
     "nada que ver"
   ];
 
+  const mentionsSpecificProduct =
+    Boolean(inferCategoryFromMessage(message)) ||
+    Boolean(inferColorFromMessage(message)) ||
+    isCandidateSelectionReference(message) ||
+    normalized.includes("las otras") ||
+    normalized.includes("los otros") ||
+    normalized.includes("lo otro");
+
+  if (mentionsSpecificProduct) {
+    return false;
+  }
+
   return cancellationPhrases.some((phrase) => normalized.includes(phrase));
 }
 
 function buildCheckoutCancellationReply(message: string): string {
-  const normalized = message.toLowerCase();
+  const normalized = normalizeResumeMessage(message);
 
-  if (normalized.includes("despues") || normalized.includes("después")) {
-    return "Está bien 🙌 Si después quieres retomarlo o ver otro producto, aquí estoy.";
+  if (normalized.includes("despues")) {
+    return "Est\u00e1 bien \ud83d\ude4c Si despu\u00e9s quer\u00e9s retomarlo o ver otro producto, aqu\u00ed estoy.";
   }
 
   if (normalized.includes("man") || normalized.includes("nel")) {
-    return "Dale, sin problema. Si quieres ver otro producto o retomar la compra después, aquí estoy.";
+    return "Dale, sin problema. Si quer\u00e9s ver otro producto o retomar la compra despu\u00e9s, aqu\u00ed estoy.";
   }
 
-  return "No hay problema. Si luego quieres seguir con la compra o ver otras opciones, te ayudo.";
+  return "No hay problema. Si luego quer\u00e9s seguir con la compra o ver otras opciones, te ayudo.";
 }
 function buildCartSearchInput(item: PendingCartItem): {
   productName: string | null;
@@ -2014,6 +2853,49 @@ function buildCartSearchInput(item: PendingCartItem): {
     category: item.category,
     color: item.color
   };
+}
+
+function matchesPendingOperationTarget(
+  pendingItem: PendingCartItem,
+  targetItem: PendingCartItem
+): boolean {
+  const pendingCategory = normalizePendingCategoryLabel(pendingItem.category);
+  const targetCategory = normalizePendingCategoryLabel(targetItem.category);
+  const pendingColor = normalizePendingColorLabel(pendingItem.color);
+  const targetColor = normalizePendingColorLabel(targetItem.color);
+
+  if (targetCategory && pendingCategory !== targetCategory) {
+    return false;
+  }
+
+  if (targetColor && pendingColor !== targetColor) {
+    return false;
+  }
+
+  const haystack = normalizeInventoryText([
+    pendingItem.productName,
+    pendingItem.category,
+    pendingItem.color,
+    ...(pendingItem.keywords ?? [])
+  ]);
+
+  if (
+    targetItem.productName &&
+    !tokenizeInventoryText(targetItem.productName).every((token) =>
+      haystack.includes(token)
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    (targetItem.keywords ?? []).length > 0 &&
+    !(targetItem.keywords ?? []).every((keyword) => haystack.includes(keyword))
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function matchesRequestedCartItem(
@@ -2099,11 +2981,22 @@ function buildPartialCartClarificationReply(
   return `${resolvedSummary}Solo me falta confirmar ${describePendingCartItem(pendingItem)} para seguir con la compra.`;
 }
 
+function buildCartReferenceReply(item: CheckoutCartItem): string {
+  return `Perfecto, tomo como referencia ${formatFocusedCartItem(item)}. Si quer\u00e9s, le ajusto cantidad o seguimos con tu pedido \ud83d\ude4c`;
+}
+
+function buildCartReferenceClarificationReply(
+  items: CheckoutCartItem[]
+): string {
+  const names = items.map((item) => item.productName).join(", ");
+  return `Quiero asegurarme de tomar el producto correcto del carrito. \u00bfTe refer\u00eds a ${names}?`;
+}
+
 function buildMultiItemCheckoutReply(items: CheckoutCartItem[]): string {
   return buildCartSummaryReply(
     "Perfecto, tengo:",
     items,
-    "Para avanzar con tu compra, compartime tu nombre, direccion de entrega y metodo de pago preferido 🙌"
+    "Para avanzar con tu compra, compartime tu nombre, direcci\u00f3n de entrega y m\u00e9todo de pago preferido \ud83d\ude4c"
   );
 }
 
@@ -2113,21 +3006,21 @@ function buildCartUpdatedReply(
 ): string {
   const addedLabel =
     addedItems.length === 1
-      ? `Perfecto, agregue ${addedItems[0].quantity} ${formatCartItemLabel(addedItems[0])} a tu pedido.`
-      : "Perfecto, agregue esos productos a tu pedido.";
+      ? `Perfecto, agregu\u00e9 ${addedItems[0].quantity} ${formatCartItemLabel(addedItems[0])} a tu pedido.`
+      : "Perfecto, agregu\u00e9 esos productos a tu pedido.";
 
   return buildCartSummaryReply(
     `${addedLabel}\nAhora tu carrito lleva:`,
     cartItems,
-    "Para seguir, compartime tu nombre, direccion de entrega y metodo de pago preferido 🙌"
+    "Para seguir, compartime tu nombre, direcci\u00f3n de entrega y m\u00e9todo de pago preferido \ud83d\ude4c"
   );
 }
 
 function buildCartModifiedReply(items: CheckoutCartItem[]): string {
   return buildCartSummaryReply(
-    "Perfecto, actualice tu pedido.\nAhora tu carrito lleva:",
+    "Perfecto, actualic\u00e9 tu pedido.\nAhora tu carrito lleva:",
     items,
-    "Si queres, seguimos con tus datos para finalizar la compra 🙌"
+    "Si quer\u00e9s, seguimos con tus datos para finalizar la compra \ud83d\ude4c"
   );
 }
 
@@ -2135,7 +3028,7 @@ function buildResumeCartReply(items: CheckoutCartItem[]): string {
   return buildCartSummaryReply(
     "Perfecto, retomemos tu pedido:",
     items,
-    "Para seguir, compartime tu nombre, direccion de entrega y metodo de pago preferido 🙌"
+    "Para seguir, compartime tu nombre, direcci\u00f3n de entrega y m\u00e9todo de pago preferido \ud83d\ude4c"
   );
 }
 
@@ -2188,6 +3081,12 @@ function formatCartItemLabel(item: CheckoutCartItem): string {
   return item.productName.toLowerCase();
 }
 
+function formatFocusedCartItem(item: CheckoutCartItem): string {
+  return item.quantity > 1
+    ? `${item.productName.toLowerCase()} (${item.quantity} unidades)`
+    : item.productName.toLowerCase();
+}
+
 function formatCartItemPrice(item: CheckoutCartItem): string {
   if (item.quantity > 1) {
     return `${item.unitPrice} ${item.currency} c/u`;
@@ -2225,6 +3124,41 @@ function removeCartItemQuantity(
   });
 }
 
+function removeCartItemGroup(
+  cartItems: CheckoutCartItem[],
+  targetCartItems: CheckoutCartItem[]
+): CheckoutCartItem[] {
+  const targetIds = new Set(targetCartItems.map((item) => item.productId));
+
+  return cartItems
+    .filter((item) => !targetIds.has(item.productId))
+    .map((item) => ({ ...item }));
+}
+
+function removePendingItemQuantity(
+  pendingItems: PendingCartItem[],
+  targetPendingItem: PendingCartItem,
+  quantity: number | null
+): PendingCartItem[] {
+  return pendingItems.flatMap((pendingItem) => {
+    if (pendingItem !== targetPendingItem) {
+      return [{ ...pendingItem, keywords: [...(pendingItem.keywords ?? [])] }];
+    }
+
+    if (quantity === null || quantity >= pendingItem.quantity) {
+      return [];
+    }
+
+    return [
+      {
+        ...pendingItem,
+        quantity: pendingItem.quantity - quantity,
+        keywords: [...(pendingItem.keywords ?? [])]
+      }
+    ];
+  });
+}
+
 function updateCartItemQuantity(
   cartItems: CheckoutCartItem[],
   targetCartItem: CheckoutCartItem,
@@ -2244,6 +3178,30 @@ function updateCartItemQuantity(
         ...cartItem,
         quantity,
         subtotal: quantity * cartItem.unitPrice
+      }
+    ];
+  });
+}
+
+function updatePendingItemQuantity(
+  pendingItems: PendingCartItem[],
+  targetPendingItem: PendingCartItem,
+  quantity: number
+): PendingCartItem[] {
+  return pendingItems.flatMap((pendingItem) => {
+    if (pendingItem !== targetPendingItem) {
+      return [{ ...pendingItem, keywords: [...(pendingItem.keywords ?? [])] }];
+    }
+
+    if (quantity <= 0) {
+      return [];
+    }
+
+    return [
+      {
+        ...pendingItem,
+        quantity,
+        keywords: [...(pendingItem.keywords ?? [])]
       }
     ];
   });
@@ -2270,6 +3228,16 @@ function mergeCheckoutCartItems(
   }
 
   return mergedItems;
+}
+
+function shouldRemoveMatchedGroup(operation: CartOperation): boolean {
+  return Boolean(
+    operation.operation === "remove_item" &&
+      operation.quantity === null &&
+      operation.category &&
+      !operation.color &&
+      !operation.productName
+  );
 }
 
 function describePendingCartItem(item: PendingCartItem): string {
@@ -2337,6 +3305,10 @@ function normalizePendingCategoryLabel(category: string | null | undefined): str
     hoodie: "hoodie",
     jogger: "jogger",
     camiseta: "camiseta",
+    camisa: "camiseta",
+    camisas: "camiseta",
+    playera: "camiseta",
+    playeras: "camiseta",
     accessory: "gorra",
     accessories: "gorra",
     accesorio: "gorra",

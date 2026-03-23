@@ -51,8 +51,10 @@ const purchaseItemSchema = {
 export async function extractPurchaseItems(
   message: string
 ): Promise<PurchaseItemInput[]> {
+  const fallbackItems = fallbackExtractPurchaseItems(message);
+
   if (!openAiClient.isConfigured()) {
-    return fallbackExtractPurchaseItems(message);
+    return fallbackItems;
   }
 
   try {
@@ -71,15 +73,23 @@ export async function extractPurchaseItems(
         schemaName: "purchase_items_extraction",
         schema: purchaseItemSchema
       });
+    const primaryItems = sanitizeExtractedItems(output.items);
 
-    return sanitizeExtractedItems(output.items);
+    if (fallbackItems.length > 1) {
+      return fallbackItems;
+    }
+
+    return keepMentionedKeywords(
+      mergeExtractedItems(primaryItems, fallbackItems),
+      message
+    );
   } catch {
-    return fallbackExtractPurchaseItems(message);
+    return fallbackItems;
   }
 }
 
 function fallbackExtractPurchaseItems(message: string): PurchaseItemInput[] {
-  const cleanedMessage = normalize(message)
+  const cleanedMessage = normalizeWithDelimiters(message)
     .replace(/\b(quiero comprar|me interesa comprar|quiero llevar|quiero|llevar|pedir|apartar)\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -89,7 +99,11 @@ function fallbackExtractPurchaseItems(message: string): PurchaseItemInput[] {
   }
 
   return sanitizeExtractedItems(
-    splitIntoCandidateItems(cleanedMessage).map((part) => parseCandidateItem(part))
+    splitIntoCandidateItems(cleanedMessage)
+      .map((part) => stripConversationalNoise(part))
+      .filter((part) => Boolean(part))
+      .filter((part) => isPotentialPurchasePart(part))
+      .map((part) => parseCandidateItem(part))
   );
 }
 
@@ -119,9 +133,12 @@ function parseCandidateItem(part: string): PurchaseItemInput {
 function sanitizeExtractedItems(items: PurchaseItemInput[]): PurchaseItemInput[] {
   return items
     .map((item) => {
-      const category = normalizeCategory(item.category);
-      const color = normalizeColor(item.color);
-      const productName = item.productName?.trim() || null;
+      const rawProductName = item.productName?.trim() || null;
+      const inferredCategory = rawProductName ? detectCategory(rawProductName) : null;
+      const inferredColor = rawProductName ? detectColor(rawProductName) : null;
+      const category = normalizeCategory(inferredCategory ?? item.category);
+      const color = normalizeColor(inferredColor ?? item.color);
+      const productName = rawProductName;
       const keywords = [...new Set((item.keywords ?? []).map(normalize).filter(Boolean))].filter(
         (keyword) => keyword !== category && keyword !== color
       );
@@ -138,6 +155,83 @@ function sanitizeExtractedItems(items: PurchaseItemInput[]): PurchaseItemInput[]
     .filter((item) => item.productName || item.category || item.color || item.keywords.length > 0);
 }
 
+function mergeExtractedItems(
+  primaryItems: PurchaseItemInput[],
+  fallbackItems: PurchaseItemInput[]
+): PurchaseItemInput[] {
+  const mergedItems: PurchaseItemInput[] = [];
+  const maxLength = Math.max(primaryItems.length, fallbackItems.length);
+
+  for (let index = 0; index < maxLength; index += 1) {
+    const item = primaryItems[index];
+    const fallbackItem = fallbackItems[index];
+
+    if (!item && fallbackItem) {
+      mergedItems.push(fallbackItem);
+      continue;
+    }
+
+    if (!item) {
+      continue;
+    }
+
+    if (!fallbackItem) {
+      mergedItems.push(item);
+      continue;
+    }
+
+    const fallbackCategory = fallbackItem.category;
+    const fallbackColor = fallbackItem.color;
+    const normalizedProductName = normalize(item.productName);
+    const shouldTrustFallbackCategory =
+      Boolean(fallbackCategory) &&
+      (!item.category ||
+        (normalizedProductName.includes(fallbackCategory!) &&
+          item.category !== fallbackCategory));
+    const category = shouldTrustFallbackCategory
+      ? fallbackCategory
+      : item.category ?? fallbackCategory;
+    const shouldTrustFallbackColor =
+      Boolean(fallbackColor) &&
+      (!item.color ||
+        item.color.includes(" ") ||
+        (item.color !== fallbackColor && category === fallbackCategory));
+    const color = shouldTrustFallbackColor
+      ? fallbackColor
+      : item.color ?? fallbackColor;
+    const productName =
+      item.productName && category && normalize(item.productName) === category
+        ? fallbackItem.productName
+        : shouldTrustFallbackCategory
+          ? fallbackItem.productName ?? item.productName
+          : item.productName ?? fallbackItem.productName;
+
+    mergedItems.push({
+      productName,
+      category,
+      color,
+      quantity: item.quantity ?? fallbackItem.quantity,
+      keywords: [...new Set([...(item.keywords ?? []), ...(fallbackItem.keywords ?? [])])]
+    });
+  }
+
+  return sanitizeExtractedItems(mergedItems);
+}
+
+function keepMentionedKeywords(
+  items: PurchaseItemInput[],
+  message: string
+): PurchaseItemInput[] {
+  const normalizedMessage = normalize(message);
+
+  return items.map((item) => ({
+    ...item,
+    keywords: (item.keywords ?? []).filter((keyword) =>
+      normalizedMessage.includes(normalize(keyword))
+    )
+  }));
+}
+
 function buildProductNameHint(
   part: string,
   context: {
@@ -151,6 +245,7 @@ function buildProductNameHint(
     ...NUMBER_WORDS,
     ...Object.keys(CATEGORY_ALIASES),
     ...Object.keys(COLOR_ALIASES),
+    ...PURCHASE_FILLER_WORDS,
     ...context.keywords
   ]);
   const rawTokens = normalize(part).split(" ").filter(Boolean);
@@ -169,7 +264,7 @@ function detectQuantity(message: string): number | null {
   }
 
   for (const [word, value] of Object.entries(NUMBER_WORD_MAP)) {
-    if (normalized.includes(word)) {
+    if (new RegExp(`\\b${word}\\b`).test(normalized)) {
       return value;
     }
   }
@@ -179,20 +274,12 @@ function detectQuantity(message: string): number | null {
 
 function detectCategory(message: string): string | null {
   const normalized = normalize(message);
-
-  return (
-    Object.entries(CATEGORY_ALIASES).find(([alias]) => normalized.includes(alias))?.[1] ??
-    null
-  );
+  return findEarliestAlias(normalized, CATEGORY_ALIASES);
 }
 
 function detectColor(message: string): string | null {
   const normalized = normalize(message);
-
-  return (
-    Object.entries(COLOR_ALIASES).find(([alias]) => normalized.includes(alias))?.[1] ??
-    null
-  );
+  return findEarliestAlias(normalized, COLOR_ALIASES);
 }
 
 function detectKeywords(message: string): string[] {
@@ -209,6 +296,74 @@ function normalize(value: string | null | undefined): string {
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeWithDelimiters(value: string | null | undefined): string {
+  return (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s,]/g, " ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripConversationalNoise(part: string): string {
+  let cleaned = part.trim();
+
+  while (
+    /^(?:y|hola|buenas|hey|ey|oye|bro|man|rey|loco|dog|fijate|mira|sabes que)\b\s*/.test(
+      cleaned
+    )
+  ) {
+    cleaned = cleaned.replace(
+      /^(?:y|hola|buenas|hey|ey|oye|bro|man|rey|loco|dog|fijate|mira|sabes que)\b\s*/,
+      ""
+    );
+  }
+
+  return cleaned
+    .replace(/\b(?:porfa|pls|por favor)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isPotentialPurchasePart(part: string): boolean {
+  if (!part || isFaqOnlyPart(part)) {
+    return false;
+  }
+
+  const category = detectCategory(part);
+  const color = detectColor(part);
+  const keywords = detectKeywords(part);
+  const quantity = detectQuantity(part);
+  const productName = buildProductNameHint(part, {
+    category,
+    color,
+    quantity: quantity ?? 1,
+    keywords
+  });
+
+  return Boolean(category || color || keywords.length > 0 || productName);
+}
+
+function isFaqOnlyPart(part: string): boolean {
+  const normalized = normalize(part);
+
+  return (
+    normalized.includes("donde estan") ||
+    normalized.includes("ubicacion") ||
+    normalized.includes("ubicados") ||
+    normalized.includes("direccion") ||
+    normalized.includes("envio") ||
+    normalized.includes("envian") ||
+    normalized.includes("delivery") ||
+    normalized.includes("metodos de pago") ||
+    normalized.includes("pago") ||
+    normalized.includes("horario") ||
+    normalized.includes("abren") ||
+    normalized.includes("cierran")
+  );
 }
 
 function normalizeCategory(value: string | null | undefined): string | null {
@@ -239,6 +394,27 @@ function normalizeColor(value: string | null | undefined): string | null {
   return COLOR_ALIASES[normalized] ?? normalized;
 }
 
+function findEarliestAlias(
+  normalizedMessage: string,
+  aliases: Record<string, string>
+): string | null {
+  let bestMatch: { index: number; value: string } | null = null;
+
+  for (const [alias, value] of Object.entries(aliases)) {
+    const index = normalizedMessage.indexOf(alias);
+
+    if (index === -1) {
+      continue;
+    }
+
+    if (!bestMatch || index < bestMatch.index) {
+      bestMatch = { index, value };
+    }
+  }
+
+  return bestMatch?.value ?? null;
+}
+
 const NUMBER_WORD_MAP: Record<string, number> = {
   un: 1,
   una: 1,
@@ -249,6 +425,17 @@ const NUMBER_WORD_MAP: Record<string, number> = {
 };
 
 const NUMBER_WORDS = Object.keys(NUMBER_WORD_MAP);
+
+const PURCHASE_FILLER_WORDS = [
+  "dame",
+  "quiero",
+  "llevar",
+  "llevarme",
+  "comprar",
+  "pedir",
+  "agregame",
+  "sumale"
+];
 
 const CATEGORY_ALIASES: Record<string, string> = {
   hoodie: "hoodie",
@@ -267,6 +454,8 @@ const CATEGORY_ALIASES: Record<string, string> = {
   camisetas: "camiseta",
   camisa: "camiseta",
   camisas: "camiseta",
+  playera: "camiseta",
+  playeras: "camiseta",
   oversized: "camiseta",
   oversize: "camiseta",
   accessory: "gorra",
@@ -280,7 +469,8 @@ const CATEGORY_ALIASES: Record<string, string> = {
   short: "short",
   shorts: "short",
   pantaloneta: "short",
-  pantalonetas: "short"
+  pantalonetas: "short",
+  ropa: "ropa"
 };
 
 const COLOR_ALIASES: Record<string, string> = {
@@ -300,7 +490,8 @@ const COLOR_ALIASES: Record<string, string> = {
   rojo: "rojo",
   rojos: "rojo",
   azul: "azul",
-  azules: "azul"
+  azules: "azul",
+  navy: "azul"
 };
 
 const SUPPORTED_KEYWORDS = [

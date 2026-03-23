@@ -25,12 +25,12 @@ function buildReply(input: GenerateReplyInput): string {
         ? ` de ${classification.quantity} unidades`
         : "";
 
-    return `${productLabel} está disponible por ${product.price} ${product.currency}. Para avanzar con tu compra${quantityText}, compartime tu nombre, dirección de entrega y método de pago preferido 🙌`;
+    return `${productLabel} est\u00e1 disponible por ${product.price} ${product.currency}. Para avanzar con tu compra${quantityText}, compartime tu nombre, direcci\u00f3n de entrega y m\u00e9todo de pago preferido \ud83d\ude4c`;
   }
 
   if (classification.intent === "product_search" && product) {
     const productLabel = formatProductLabel(product.name);
-    return `${productLabel} está disponible por ${product.price} ${product.currency}. Si quieres, también te ayudo con disponibilidad o compra.`;
+    return `${productLabel} est\u00e1 disponible por ${product.price} ${product.currency}. Si quer\u00e9s, tambi\u00e9n te ayudo con disponibilidad o compra.`;
   }
 
   if (
@@ -55,12 +55,12 @@ function buildReply(input: GenerateReplyInput): string {
     product
   ) {
     if (classification.intent === "price_question") {
-      return `${product.name} cuesta ${product.price} ${product.currency}. Si quieres, te ayudo a seguir con la compra.`;
+      return `${product.name} cuesta ${product.price} ${product.currency}. Si quer\u00e9s, te ayudo a seguir con la compra.`;
     }
 
     return product.stock > 0
-      ? `Sí, ${product.name} está disponible. Nos quedan ${product.stock} unidades.`
-      : `En este momento ${product.name} no está disponible. Si quieres, te paso con alguien del equipo.`;
+      ? `S\u00ed, ${product.name} est\u00e1 disponible. Nos quedan ${product.stock} unidades.`
+      : `Ahorita ${product.name} no est\u00e1 disponible. Si quer\u00e9s, te paso con alguien del equipo.`;
   }
 
   if (classification.handoff) {
@@ -68,10 +68,10 @@ function buildReply(input: GenerateReplyInput): string {
   }
 
   if (!product && products.length === 0) {
-    return "No encontré una coincidencia clara. Si quieres, dime el producto, color o categoría y te ayudo.";
+    return "No encontr\u00e9 una coincidencia clara. Decime el producto, color o categor\u00eda y te ayudo.";
   }
 
-  return "Gracias por escribirnos. Si me compartes un poco más, te ayudo.";
+  return "Gracias por escribirnos. Si me compart\u00eds un poco m\u00e1s, te ayudo.";
 }
 
 function buildProductListReply(
@@ -82,7 +82,7 @@ function buildProductListReply(
     classification.category && classification.color
       ? `Estas son las opciones de ${pluralizeCategory(classification.category)} ${formatColorListLabel(classification.color, classification.category)} que tenemos`
       : classification.color
-        ? `Estas son las opciones ${formatColorListLabel(classification.color)} que tenemos`
+        ? `Estas son las prendas ${formatColorListLabel(classification.color)} que tenemos`
         : classification.category
           ? `Estas son las opciones de ${pluralizeCategory(classification.category)} que tenemos`
           : "Estas son algunas opciones que tenemos";
@@ -96,10 +96,10 @@ function buildAvailabilityListReply(
 ): string {
   const subject =
     classification.category && classification.color
-      ? `Sí, tenemos ${pluralizeCategory(classification.category)} en ${classification.color}`
+      ? `S\u00ed, tenemos ${pluralizeCategory(classification.category)} en ${classification.color}`
       : classification.category
-        ? `Sí, tenemos ${pluralizeCategory(classification.category)} disponibles`
-        : "Sí, tenemos estas opciones disponibles";
+        ? `S\u00ed, tenemos ${pluralizeCategory(classification.category)} disponibles`
+        : "S\u00ed, tenemos estas opciones disponibles";
 
   return `${subject}: ${formatProductList(products)}.`;
 }
@@ -133,11 +133,16 @@ function formatProductLabel(productName: string): string {
 }
 
 function pluralizeCategory(category: string): string {
-  if (category.endsWith("s")) {
-    return category;
-  }
+  const pluralByCategory: Record<string, string> = {
+    camiseta: "camisetas",
+    hoodie: "hoodies",
+    jogger: "joggers",
+    gorra: "gorras",
+    polo: "polos",
+    short: "shorts"
+  };
 
-  return `${category}s`;
+  return pluralByCategory[category] ?? (category.endsWith("s") ? category : `${category}s`);
 }
 
 function formatColorListLabel(
