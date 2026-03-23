@@ -14,6 +14,7 @@ export type InventoryMatchResult = {
   product: InventoryItem | null;
   alternatives: InventoryItem[];
   products: InventoryItem[];
+  availableColors: string[];
 };
 
 export type InventorySearchInput = {

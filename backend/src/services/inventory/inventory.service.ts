@@ -28,11 +28,25 @@ class InventoryService {
   }
 
   findMatch(input: InventorySearchInput | null | undefined): InventoryMatchResult {
-    const safeInput = input ?? {};
-    const scoredItems = this.search(safeInput);
+    const safeInput = normalizeSearchInput(input);
+    const strictResult = this.findStructuredMatches(this.getInventory(), safeInput);
+
+    if (strictResult) {
+      return strictResult;
+    }
+
+    const scoredItems = this.searchByNameOnly(
+      this.getInventory(),
+      safeInput.productName
+    );
 
     if (scoredItems.length === 0) {
-      return { product: null, alternatives: [], products: [] };
+      return {
+        product: null,
+        alternatives: [],
+        products: [],
+        availableColors: []
+      };
     }
 
     const topScore = scoredItems[0].score;
@@ -44,48 +58,186 @@ class InventoryService {
       return {
         product: null,
         alternatives: strongMatches.map((entry) => entry.item).slice(0, 3),
-        products: strongMatches.map((entry) => entry.item)
+        products: strongMatches.map((entry) => entry.item),
+        availableColors: getAvailableColors(strongMatches.map((entry) => entry.item))
       };
     }
 
     return {
       product: scoredItems[0].item,
       alternatives: [],
-      products: scoredItems.map((entry) => entry.item)
+      products: scoredItems.map((entry) => entry.item),
+      availableColors: getAvailableColors(scoredItems.map((entry) => entry.item))
     };
   }
 
-  search(
+  findMatchInItems(
+    items: InventoryItem[],
     input: InventorySearchInput | null | undefined
-  ): Array<{ item: InventoryItem; score: number }> {
-    const safeInput = input ?? {};
-    const normalizedProductName = normalize(safeInput.productName ?? "");
-    const normalizedCategory = normalizeCategory(safeInput.category);
-    const normalizedColor = normalizeColor(safeInput.color);
+  ): InventoryMatchResult {
+    const safeInput = normalizeSearchInput(input);
+    const strictResult = this.findStructuredMatches(items, safeInput);
 
-    return this.getInventory()
+    if (strictResult) {
+      return strictResult;
+    }
+
+    const scoredItems = this.searchByNameOnly(items, safeInput.productName);
+
+    if (scoredItems.length === 0) {
+      return {
+        product: null,
+        alternatives: [],
+        products: [],
+        availableColors: []
+      };
+    }
+
+    const topScore = scoredItems[0].score;
+    const strongMatches = scoredItems.filter(
+      (entry) => topScore - entry.score <= 10 && entry.score >= 35
+    );
+
+    if (strongMatches.length > 1) {
+      return {
+        product: null,
+        alternatives: strongMatches.map((entry) => entry.item).slice(0, 3),
+        products: strongMatches.map((entry) => entry.item),
+        availableColors: getAvailableColors(strongMatches.map((entry) => entry.item))
+      };
+    }
+
+    return {
+      product: scoredItems[0].item,
+      alternatives: [],
+      products: scoredItems.map((entry) => entry.item),
+      availableColors: getAvailableColors(scoredItems.map((entry) => entry.item))
+    };
+  }
+
+  private findStructuredMatches(
+    items: InventoryItem[],
+    input: { productName: string; category: string; color: string }
+  ): InventoryMatchResult | null {
+    const hasCategory = Boolean(input.category);
+    const hasColor = Boolean(input.color);
+
+    if (!hasCategory && !hasColor) {
+      return null;
+    }
+
+    let baseItems = items;
+
+    if (hasCategory) {
+      baseItems = baseItems.filter(
+        (item) => normalizeCategory(item.category) === input.category
+      );
+    }
+
+    if (hasColor) {
+      const colorFilteredItems = baseItems.filter(
+        (item) => normalizeColor(item.color) === input.color
+      );
+
+      if (colorFilteredItems.length === 0) {
+        return {
+          product: null,
+          alternatives: [],
+          products: [],
+          availableColors: getAvailableColors(baseItems)
+        };
+      }
+
+      baseItems = colorFilteredItems;
+    }
+
+    if (input.productName) {
+      const scoredItems = baseItems
+        .map((item) => ({
+          item,
+          score: scoreItemByName(item, input.productName)
+        }))
+        .filter((entry) => entry.score > 0)
+        .sort((left, right) => right.score - left.score);
+
+      if (scoredItems.length === 0) {
+        return {
+          product: null,
+          alternatives: [],
+          products: [],
+          availableColors: getAvailableColors(baseItems)
+        };
+      }
+
+      return buildRankedResult(scoredItems);
+    }
+
+    return buildRankedResult(baseItems.map((item) => ({ item, score: 100 })));
+  }
+
+  private searchByNameOnly(
+    items: InventoryItem[],
+    productName: string
+  ): Array<{ item: InventoryItem; score: number }> {
+    if (!productName) {
+      return [];
+    }
+
+    return items
       .map((item) => ({
         item,
-        score: scoreItem(item, {
-          productName: normalizedProductName,
-          category: normalizedCategory,
-          color: normalizedColor
-        })
+        score: scoreItemByName(item, productName)
       }))
       .filter((entry) => entry.score > 0)
       .sort((left, right) => right.score - left.score);
   }
 }
 
-function scoreItem(
-  item: InventoryItem,
-  input: { productName: string; category: string; color: string }
-): number {
-  let score = 0;
-  let matchedStructuredFilter = false;
+function buildRankedResult(
+  entries: Array<{ item: InventoryItem; score: number }>
+): InventoryMatchResult {
+  if (entries.length === 0) {
+    return {
+      product: null,
+      alternatives: [],
+      products: [],
+      availableColors: []
+    };
+  }
+
+  const sortedEntries = [...entries].sort((left, right) => right.score - left.score);
+
+  if (sortedEntries.length > 1) {
+    return {
+      product: null,
+      alternatives: sortedEntries.map((entry) => entry.item).slice(0, 3),
+      products: sortedEntries.map((entry) => entry.item),
+      availableColors: getAvailableColors(sortedEntries.map((entry) => entry.item))
+    };
+  }
+
+  return {
+    product: sortedEntries[0].item,
+    alternatives: [],
+    products: sortedEntries.map((entry) => entry.item),
+    availableColors: getAvailableColors(sortedEntries.map((entry) => entry.item))
+  };
+}
+
+function normalizeSearchInput(
+  input: InventorySearchInput | null | undefined
+): { productName: string; category: string; color: string } {
+  const safeInput = input ?? {};
+
+  return {
+    productName: normalize(safeInput.productName ?? ""),
+    category: normalizeCategory(safeInput.category),
+    color: normalizeColor(safeInput.color)
+  };
+}
+
+function scoreItemByName(item: InventoryItem, normalizedProductName: string): number {
   const normalizedName = normalize(item.name);
-  const normalizedCategory = normalizeCategory(item.category);
-  const normalizedColor = normalizeColor(item.color);
   const keywordPhrases = (item.keywords ?? []).map(normalize);
   const tokenPool = new Set([
     ...tokenize(item.name),
@@ -94,53 +246,33 @@ function scoreItem(
     ...keywordPhrases.flatMap((keyword) => tokenize(keyword))
   ]);
 
-  if (input.category) {
-    if (normalizedCategory === input.category) {
-      score += 45;
-      matchedStructuredFilter = true;
-    } else if (normalizedCategory.includes(input.category)) {
-      score += 25;
-      matchedStructuredFilter = true;
-    }
+  let score = 0;
+
+  if (normalizedName === normalizedProductName) {
+    score += 100;
   }
 
-  if (input.color) {
-    if (normalizedColor === input.color) {
-      score += 35;
-      matchedStructuredFilter = true;
-    } else if (normalizedName.includes(input.color)) {
-      score += 20;
-      matchedStructuredFilter = true;
-    }
+  if (normalizedName.includes(normalizedProductName)) {
+    score += 60;
   }
 
-  if (input.productName) {
-    if (normalizedName === input.productName) {
-      score += 100;
-    }
-
-    if (normalizedName.includes(input.productName)) {
-      score += 60;
-    }
-
-    if (keywordPhrases.includes(input.productName)) {
-      score += 70;
-    }
-
-    for (const token of tokenize(input.productName)) {
-      if (tokenPool.has(token)) {
-        score += 18;
-      } else if ([...tokenPool].some((poolToken) => poolToken.includes(token))) {
-        score += 8;
-      }
-    }
+  if (keywordPhrases.includes(normalizedProductName)) {
+    score += 70;
   }
 
-  if (!input.productName && matchedStructuredFilter) {
-    score += 10;
+  for (const token of tokenize(normalizedProductName)) {
+    if (tokenPool.has(token)) {
+      score += 18;
+    } else if ([...tokenPool].some((poolToken) => poolToken.includes(token))) {
+      score += 8;
+    }
   }
 
   return score;
+}
+
+function getAvailableColors(items: InventoryItem[]): string[] {
+  return [...new Set(items.map((item) => item.color))].sort();
 }
 
 function normalize(value: string | null | undefined): string {
@@ -173,7 +305,15 @@ function singularize(token: string): string {
 }
 
 function normalizeCategory(value: string | null | undefined): string {
-  return singularize(normalize(value));
+  const normalized = singularize(normalize(value));
+  const aliases: Record<string, string> = {
+    hudi: "hoodie",
+    yuger: "jogger",
+    polo: "polo",
+    pantaloneta: "short"
+  };
+
+  return aliases[normalized] ?? normalized;
 }
 
 function normalizeColor(value: string | null | undefined): string {
@@ -185,6 +325,10 @@ function normalizeColor(value: string | null | undefined): string {
 
   if (normalized === "blanca") {
     return "blanco";
+  }
+
+  if (normalized === "roja") {
+    return "rojo";
   }
 
   return normalized;

@@ -1,5 +1,4 @@
 import { InventoryItem } from "../../services/inventory/inventory.types";
-import { openAiClient } from "../../services/openai/openai.client";
 import { IntentClassification } from "./ai.types";
 
 type GenerateReplyInput = {
@@ -27,6 +26,11 @@ function buildReply(input: GenerateReplyInput): string {
         : "";
 
     return `${productLabel} está disponible por ${product.price} ${product.currency}. Para avanzar con tu compra${quantityText}, compartime tu nombre, dirección de entrega y método de pago preferido 🙌`;
+  }
+
+  if (classification.intent === "product_search" && product) {
+    const productLabel = formatProductLabel(product.name);
+    return `${productLabel} está disponible por ${product.price} ${product.currency}. Si quieres, también te ayudo con disponibilidad o compra.`;
   }
 
   if (
@@ -74,11 +78,14 @@ function buildProductListReply(
   products: InventoryItem[],
   classification: IntentClassification
 ): string {
-  const intro = classification.color
-    ? `Estas son las opciones ${formatColorListLabel(classification.color)} que tenemos`
-    : classification.category
-      ? `Estas son las opciones de ${pluralizeCategory(classification.category)} que tenemos`
-      : "Estas son algunas opciones que tenemos";
+  const intro =
+    classification.category && classification.color
+      ? `Estas son las opciones de ${pluralizeCategory(classification.category)} ${formatColorListLabel(classification.color, classification.category)} que tenemos`
+      : classification.color
+        ? `Estas son las opciones ${formatColorListLabel(classification.color)} que tenemos`
+        : classification.category
+          ? `Estas son las opciones de ${pluralizeCategory(classification.category)} que tenemos`
+          : "Estas son algunas opciones que tenemos";
 
   return `${intro}: ${formatProductList(products)}.`;
 }
@@ -87,9 +94,12 @@ function buildAvailabilityListReply(
   products: InventoryItem[],
   classification: IntentClassification
 ): string {
-  const subject = classification.category
-    ? `Sí, tenemos ${pluralizeCategory(classification.category)} disponibles`
-    : "Sí, tenemos estas opciones disponibles";
+  const subject =
+    classification.category && classification.color
+      ? `Sí, tenemos ${pluralizeCategory(classification.category)} en ${classification.color}`
+      : classification.category
+        ? `Sí, tenemos ${pluralizeCategory(classification.category)} disponibles`
+        : "Sí, tenemos estas opciones disponibles";
 
   return `${subject}: ${formatProductList(products)}.`;
 }
@@ -106,9 +116,11 @@ function formatProductLabel(productName: string): string {
     camisa: "La",
     camiseta: "La",
     gorra: "La",
-    hoodie: "La",
+    hoodie: "El",
     jogger: "El",
-    cargo: "El"
+    cargo: "El",
+    polo: "El",
+    short: "El"
   };
   const [firstWord] = productName.toLowerCase().split(" ");
   const article = articleByFirstWord[firstWord];
@@ -128,13 +140,33 @@ function pluralizeCategory(category: string): string {
   return `${category}s`;
 }
 
-function formatColorListLabel(color: string): string {
+function formatColorListLabel(
+  color: string,
+  category?: string | null
+): string {
+  const masculineCategories = new Set([
+    "hoodie",
+    "jogger",
+    "cargo",
+    "polo",
+    "short"
+  ]);
+  const useMasculine = category ? masculineCategories.has(category) : false;
+
   if (color === "negra" || color === "negro") {
-    return "negras";
+    return useMasculine ? "negros" : "negras";
   }
 
   if (color === "blanca" || color === "blanco") {
-    return "blancas";
+    return useMasculine ? "blancos" : "blancas";
+  }
+
+  if (color === "roja" || color === "rojo") {
+    return useMasculine ? "rojos" : "rojas";
+  }
+
+  if (color === "gris") {
+    return "grises";
   }
 
   return color;
