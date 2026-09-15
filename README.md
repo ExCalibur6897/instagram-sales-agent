@@ -1,138 +1,209 @@
-# Instagram Sales Agent v0.2
+﻿# Instagram Sales Agent
 
-Proyecto de practica para un agente de ventas de Instagram. Esta version integra OpenAI en el backend para clasificar la intencion del mensaje y generar respuestas breves en espanol.
+Context-aware AI sales agent built with TypeScript, Express, and the OpenAI API.
 
-## Stack
+The project explores how a conversational sales assistant can understand informal customer messages, maintain short-term context, search a product inventory, manage a shopping cart, and guide users through a checkout flow.
 
+## Overview
+
+Instagram Sales Agent is a backend prototype designed to simulate automated sales conversations through a social-media messaging channel.
+
+Instead of treating every message independently, the system maintains conversational state per user and uses that context to resolve references, products, purchase intentions, and ongoing checkout operations.
+
+## Features
+
+- AI-powered intent classification and natural-language responses
+- Context-aware product matching
+- Short-term conversational memory per user
+- Multi-intent message handling
+- Product, category and color recognition
+- Shopping cart management
+- Multi-item purchase flows
+- Add, remove and reduce cart items during checkout
+- Resume or cancel an existing purchase flow
+- Order-data extraction
+- Inventory-backed price and availability responses
+- Human handoff signals when appropriate
+- Fallback behavior when the OpenAI API is unavailable
+- Debug endpoints for inspecting orders and conversational state
+
+## Tech Stack
+
+- TypeScript
 - Node.js
 - Express
-- TypeScript
 - OpenAI API
 - dotenv
+- JSON-based product inventory
 
-## Estructura
+## Architecture
 
-```text
+~~~text
 backend/
-  src/
-    config/
-    modules/
-      ai/
-      messages/
-    services/
-      inventory/
-      openai/
+├── src/
+│   ├── config/
+│   ├── modules/
+│   │   ├── ai/
+│   │   └── messages/
+│   └── services/
+│       ├── checkout/
+│       ├── conversation/
+│       ├── inventory/
+│       └── openai/
+└── package.json
+
 data/
-  inventory.json
-```
+└── inventory.json
+~~~
 
-## Requisitos
+The message-processing layer coordinates AI classification, contextual memory, inventory matching and checkout state.
 
-- Node.js 20 o superior
+## Conversation Flow
+
+~~~text
+Customer Message
+       |
+       v
+Intent & Entity Extraction
+       |
+       v
+Conversation Context
+       |
+       +----> Inventory Matching
+       |
+       +----> Cart / Checkout State
+       |
+       v
+Business Logic
+       |
+       v
+AI-Assisted Response
+       |
+       v
+Customer Reply / Handoff
+~~~
+
+## Example
+
+A customer can send an informal message such as:
+
+~~~text
+Hola, cuánto cuesta la negra?
+~~~
+
+The system can use recent conversation context and inventory information to determine which product the customer is referring to and generate an appropriate response.
+
+During a purchase flow, users can also modify their cart naturally:
+
+~~~text
+Quitame una de esas y agregame otra gris.
+~~~
+
+The backend processes the requested operations while preserving the active checkout state.
+
+## Local Setup
+
+Requirements:
+
+- Node.js 20+
 - npm
-- Una API key de OpenAI
+- OpenAI API key
 
-## Configuracion local
+Clone the repository and enter the backend directory:
 
-1. Entra al backend:
+~~~bash
+git clone git@github.com:ExCalibur6897/instagram-sales-agent.git
+cd instagram-sales-agent/backend
+~~~
 
-```bash
-cd backend
-```
+Install dependencies:
 
-2. Instala dependencias:
-
-```bash
+~~~bash
 npm install
-```
+~~~
 
-3. Crea el archivo `.env`:
+Create your environment file:
 
-```bash
+~~~bash
 copy .env.example .env
-```
+~~~
 
-4. Configura tus variables:
+Configure:
 
-```env
+~~~env
 PORT=3000
-OPENAI_API_KEY=tu_api_key
+OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-4.1-mini
-```
+~~~
 
-5. Inicia el servidor:
+Start development mode:
 
-```bash
+~~~bash
 npm run dev
-```
+~~~
 
-El backend corre por defecto en `http://localhost:3000`.
+The backend runs by default at:
 
-## Scripts
+~~~text
+http://localhost:3000
+~~~
 
-- `npm run dev`: inicia el servidor con recarga automatica
-- `npm run build`: compila TypeScript a `dist/`
-- `npm run start`: ejecuta la version compilada
+## API
 
-## Endpoint
+### POST `/message`
 
-### `POST /message`
+Processes an incoming customer message.
 
-Recibe un mensaje, clasifica la intencion, busca producto en `data/inventory.json` si hace falta y genera una respuesta final.
+Example:
 
-La busqueda de productos tolera referencias parciales o informales usando normalizacion de texto, coincidencias parciales y keywords del inventario. Si hay varias coincidencias razonables, el backend pide aclaracion.
-
-Para pruebas del flujo de compra, puedes enviar tambien `userId` en el body. Ese identificador se usa para mantener en memoria el estado `collect_order_data` entre mensajes del mismo usuario.
-El backend tambien guarda memoria corta por `userId` para contexto reciente: ultimo producto, categoria, color e intent.
-
-Ejemplo:
-
-```bash
-curl -X POST http://localhost:3000/message ^
-  -H "Content-Type: application/json" ^
-  -d "{\"userId\":\"wilson\",\"message\":\"Hola, cuanto cuesta la negra?\"}"
-```
-
-Respuesta esperada:
-
-```json
+~~~json
 {
-  "success": true,
-  "data": {
-    "channel": "instagram",
-    "userMessage": "Hola, cuanto cuesta la negra?",
-    "intent": "price_question",
-    "productFound": true,
-    "agentReply": "La Camiseta negra oversize cuesta 420 HNL. Si quieres, te ayudo a seguir con la compra.",
-    "usedOpenAI": true,
-    "handoff": false
-  }
+  "userId": "demo-user",
+  "message": "Quiero comprar una camiseta negra"
 }
-```
+~~~
 
-### `GET /debug/orders`
+The service evaluates the user's intent, conversational context, inventory and active purchase state before generating the response.
 
-Devuelve todas las ordenes guardadas en memoria para pruebas locales.
+### GET `/debug/orders`
 
-### `GET /debug/state`
+Returns orders currently stored by the prototype.
 
-Devuelve el estado actual en memoria de usuarios que siguen en flujo de compra y la memoria corta conversacional por usuario.
+### GET `/debug/state`
 
-## Modulos principales
+Returns active checkout and short-term conversational state for debugging.
 
-- `src/modules/ai/classify-intent.ts`: clasifica intencion, tono, handoff y producto
-- `src/modules/ai/generate-reply.ts`: genera una respuesta corta y natural en espanol
-- `src/services/inventory/inventory.service.ts`: carga el inventario y busca productos
-- `src/services/openai/openai.client.ts`: usa el SDK oficial y la API `responses`
+## OpenAI Integration
 
-## Comportamiento esperado
+The project uses the OpenAI API for language-understanding tasks such as intent recognition, structured data extraction and response generation.
 
-- El sistema usa OpenAI para clasificar y responder.
-- Si la consulta es sobre precio o disponibilidad, intenta usar `inventory.json` como contexto.
-- La busqueda de productos acepta nombres incompletos como `gorra`, `hoodie gris` o `la negra` cuando hay una mejor coincidencia clara.
-- El backend entiende mejor consultas abiertas como categorias, colores, listas y referencias al contexto reciente.
-- Si un usuario entra en `nextStep = collect_order_data`, el backend recuerda ese estado en memoria usando `userId`.
-- Cuando el usuario envia sus datos, el backend extrae nombre, direccion y metodo de pago, los guarda en memoria y confirma el cierre.
-- Puedes revisar lo guardado localmente en `/debug/orders` y `/debug/state`.
-- Si no encuentra informacion confiable, evita inventar datos y sugiere pasar con alguien del equipo.
-- Si `OPENAI_API_KEY` no esta configurada, usa respuestas de respaldo para seguir funcionando en local.
+Business-critical product information is resolved against the local inventory rather than invented by the model.
+
+If the API is not configured, fallback behavior allows parts of the backend to continue operating locally.
+
+## Project Purpose
+
+This project was created to explore the design of practical AI agents that combine large language models with deterministic application logic.
+
+The main focus was not simply generating chatbot responses, but coordinating:
+
+- natural-language understanding
+- application state
+- product inventory
+- cart operations
+- checkout logic
+- conversational context
+
+This separation keeps business rules under application control while using AI where flexible language understanding is useful.
+
+## Current Scope
+
+This is a prototype backend rather than a production Instagram integration.
+
+Messages are submitted through the API, inventory is stored locally, and conversational / checkout state is currently maintained for development and demonstration purposes.
+
+## Author
+
+**Wilson Guerra**  
+Computer Systems Engineering student  
+GitHub: [@ExCalibur6897](https://github.com/ExCalibur6897)
